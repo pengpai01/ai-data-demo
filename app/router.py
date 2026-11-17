@@ -100,29 +100,35 @@ def _period_in_text(text: str) -> str | None:
     return None
 
 
+PERIOD_BLOCK = "暂不支持该期间。演示数据的经营月份是 2025年11月 至 2026年10月。"
+
+
+def resolve_period(text: str, period: str = DEFAULT_PERIOD) -> str:
+    return _period_in_text(text.strip()) or period or DEFAULT_PERIOD
+
+
+def hard_block(text: str, period: str) -> str | None:
+    """Out-of-map words and out-of-range months are refused before any routing."""
+    raw = text.strip()
+    compact = _compact(raw)
+    for word, message in UNSUPPORTED:
+        if word in raw or word in compact:
+            return message
+    if period < DATA_START or period > DATA_END:
+        return PERIOD_BLOCK
+    return None
+
+
 def classify(text: str, period: str = DEFAULT_PERIOD, view: str = "auto") -> Query:
     raw = text.strip()
     compact = _compact(raw)
-    chosen = period or DEFAULT_PERIOD
-    written = _period_in_text(raw)
-    if written:
-        chosen = written
+    chosen = resolve_period(raw, period)
     if view not in {"auto", "region", "product"}:
         view = "auto"
 
-    for word, message in UNSUPPORTED:
-        if word in raw or word in compact:
-            return Query("unsupported", "unsupported", raw, chosen, view, message=message)
-
-    if chosen < DATA_START or chosen > DATA_END:
-        return Query(
-            "unsupported",
-            "unsupported",
-            raw,
-            chosen,
-            view,
-            message="暂不支持该期间。演示数据的经营月份是 2025年11月 至 2026年10月。",
-        )
+    blocked = hard_block(raw, chosen)
+    if blocked:
+        return Query("unsupported", "unsupported", raw, chosen, view, message=blocked)
 
     regions = [rid for name, rid in REGION_NAMES if name in raw]
     region_id = regions[0] if len(regions) == 1 else None

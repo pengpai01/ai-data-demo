@@ -1,28 +1,31 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>星澜诊断 · 经营分析助手</title>
-  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="/static/app.css?v=15" />
 </head>
 <body>
   <header class="top">
-    <div class="brand">星澜诊断 · 经营分析助手</div>
+    <div class="brand">经营分析助手</div>
     <label class="period">
       期间
       <select id="period" aria-label="期间"></select>
     </label>
-    <span class="badge">演示数据·虚构</span>
+    <button type="button" id="chat-open" class="chat-open" aria-controls="chat" aria-pressed="true" title="隐藏对话栏">对话</button>
   </header>
   <main class="shell">
     <section class="report" id="report" aria-live="polite">
       <p class="placeholder">正在计算上个月的销售回款率…</p>
     </section>
-    <section class="chat">
+    <section class="chat" id="chat">
       <div class="chat-head">
         <strong>对话</strong>
-        <span>追问会更新左侧报告</span>
+        <span class="chat-head-right">
+          追问会更新左侧报告
+          <button type="button" id="chat-hide" class="chat-hide" title="隐藏对话栏">隐藏 ›</button>
+        </span>
       </div>
       <div id="messages" class="messages"></div>
       <div id="chips" class="chips"></div>
@@ -32,6 +35,7 @@
       </form>
     </section>
   </main>
+  <button type="button" id="chat-show" class="chat-show" aria-controls="chat" hidden>展开对话 ‹</button>
   <div id="modal" class="modal" hidden>
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
       <header>
@@ -41,6 +45,6 @@
       <div id="modal-body"></div>
     </div>
   </div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=15"></script>
 </body>
 </html>

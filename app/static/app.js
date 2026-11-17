@@ -1,6 +1,6 @@
 const COLORS = ["#8aa4ab", "#0f6f78", "#c9842a", "#5c6b73"];
 const LINE_COLORS = ["#0f6f78", "#c9842a", "#3d5a80", "#8d4e2a", "#2f7d4a"];
-const state = { question: "", view: "auto", period: "2026-10", main: "" };
+const state = { question: "", view: "auto", period: "2026-10", main: "", history: [] };
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -21,6 +21,18 @@ function push(role, text) {
   node.textContent = text;
   $("#messages").appendChild(node);
   $("#messages").scrollTop = $("#messages").scrollHeight;
+  return node;
+}
+
+function setChatHidden(hidden) {
+  $(".shell").classList.toggle("chat-hidden", hidden);
+  $("#chat-open").setAttribute("aria-pressed", String(!hidden));
+  $("#chat-open").title = hidden ? "展开对话栏" : "隐藏对话栏";
+  $("#chat-show").hidden = !hidden;
+  if (!hidden) {
+    $("#messages").scrollTop = $("#messages").scrollHeight;
+    $("#chat").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
 }
 
 function formatY(value, fmt) {
@@ -72,31 +84,71 @@ function axis(min, max, fmt, x, plot, innerH) {
   return marks;
 }
 
-function scale(values) {
+function scale(values, tight) {
   const nums = values.filter((value) => value != null && !Number.isNaN(value));
-  let min = Math.min(0, ...nums);
-  let max = Math.max(0, ...nums);
+  if (!nums.length) return { min: 0, max: 1 };
+  let min = Math.min(...nums);
+  let max = Math.max(...nums);
+  if (tight && min >= 0) {
+    const span = max - min || Math.abs(max) || 1;
+    min = Math.max(0, min - span * 0.45);
+    max += span * 0.2;
+  } else {
+    min = Math.min(0, min);
+    max = Math.max(0, max);
+  }
   if (!Number.isFinite(min) || !Number.isFinite(max) || max === min) {
     min = 0;
     max = 1;
   }
   const span = max - min || 1;
   if (min < 0) min -= span * 0.08;
-  max += span * 0.16;
+  if (!tight) max += span * 0.16;
   return { min, max };
+}
+
+function textWidth(name, fontSize) {
+  let width = 0;
+  for (const ch of String(name)) width += ch.charCodeAt(0) > 255 ? fontSize : fontSize * 0.55;
+  return width;
+}
+
+function categoryLabels(names, xOf, axisY) {
+  const fontSize = 11;
+  const gap = names.length > 1 ? Math.abs(xOf(1) - xOf(0)) : 999;
+  const widest = Math.max(1, ...names.map((name) => textWidth(name, fontSize)));
+  const slant = names.length > 4 && widest > gap * 0.82;
+  const angle = 42;
+  const depth = slant ? Math.ceil(widest * Math.sin((angle * Math.PI) / 180) + 16) : 28;
+  const marks = names.map((name, index) => {
+    const x = xOf(index).toFixed(1);
+    if (!slant) {
+      return `<text x="${x}" y="${axisY + 16}" text-anchor="middle" font-size="${fontSize}" fill="#14262c" data-drill="${esc(name)}">${esc(name)}</text>`;
+    }
+    const y = axisY + 10;
+    return `<text x="${x}" y="${y}" text-anchor="start" font-size="${fontSize}" fill="#14262c" data-drill="${esc(name)}" transform="rotate(${angle} ${x} ${y})">${esc(name)}</text>`;
+  }).join("");
+  return { marks, depth, slant, widest };
 }
 
 function groupedBar(chart) {
   const width = 640;
-  const height = 280;
-  const plot = { l: 54, r: 12, t: 12, b: 48 };
-  const innerW = width - plot.l - plot.r;
-  const innerH = height - plot.t - plot.b;
+  const plot = { l: 54, r: 16, t: 12 };
+  const innerH = 200;
   const cats = chart.categories || [];
   const series = chart.series || [];
+  const widest = Math.max(1, ...cats.map((name) => textWidth(name, 11)), 1);
+  const trialGap = (width - plot.l - plot.r) / Math.max(cats.length, 1);
+  if (cats.length > 4 && widest > trialGap * 0.82) {
+    plot.r += Math.ceil(widest * Math.cos((42 * Math.PI) / 180) - trialGap / 2 + 8);
+  }
+  const innerW = width - plot.l - plot.r;
+  const band = innerW / Math.max(cats.length, 1);
+  const xOf = (index) => plot.l + band * index + band / 2;
+  const labels = categoryLabels(cats, xOf, plot.t + innerH);
+  const height = plot.t + innerH + labels.depth;
   const { min, max } = scale(series.flatMap((item) => item.values || []));
   const yOf = (value) => plot.t + ((max - value) / (max - min)) * innerH;
-  const band = innerW / Math.max(cats.length, 1);
   const group = band * 0.72;
   const barW = group / Math.max(series.length, 1);
   let shapes = axis(min, max, chart.y_format, width - plot.r, plot, innerH);
@@ -116,22 +168,24 @@ function groupedBar(chart) {
       const muted = (chart.muted || []).includes(name);
       shapes += `<rect x="${x}" y="${Math.min(y, zero)}" width="${Math.max(barW - 2, 1)}" height="${Math.max(h, 0)}" fill="${COLORS[seriesIndex % COLORS.length]}" opacity="${muted ? 0.35 : 1}" data-drill="${esc(name)}" />`;
     });
-    shapes += `<text x="${cx}" y="${height - 16}" text-anchor="middle" font-size="11" fill="#14262c" data-drill="${esc(name)}">${esc(name)}</text>`;
   });
+  shapes += labels.marks;
   return `<svg viewBox="0 0 ${width} ${height}">${shapes}</svg>`;
 }
 
 function lineChart(chart) {
   const width = 640;
-  const height = 280;
-  const plot = { l: 54, r: 12, t: 12, b: 48 };
-  const innerW = width - plot.l - plot.r;
-  const innerH = height - plot.t - plot.b;
+  const plot = { l: 54, r: 16, t: 12 };
+  const innerH = 200;
   const cats = chart.categories || [];
   const series = chart.series || [];
-  const { min, max } = scale(series.flatMap((item) => item.values || []));
+  const innerW = width - plot.l - plot.r;
+  const inset = 30;
+  const xOf = (index) => plot.l + (cats.length <= 1 ? innerW / 2 : inset + ((innerW - inset * 2) * index) / (cats.length - 1));
+  const labels = categoryLabels(cats, xOf, plot.t + innerH);
+  const height = plot.t + innerH + labels.depth;
+  const { min, max } = scale(series.flatMap((item) => item.values || []), chart.y_format === "pct");
   const yOf = (value) => plot.t + ((max - value) / (max - min)) * innerH;
-  const xOf = (index) => plot.l + (cats.length <= 1 ? innerW / 2 : (innerW * index) / (cats.length - 1));
   let shapes = axis(min, max, chart.y_format, width - plot.r, plot, innerH);
   series.forEach((item, seriesIndex) => {
     const color = LINE_COLORS[seriesIndex % LINE_COLORS.length];
@@ -142,31 +196,34 @@ function lineChart(chart) {
       shapes += `<circle cx="${xOf(index)}" cy="${yOf(value)}" r="3" fill="${color}" />`;
     });
   });
-  cats.forEach((name, index) => {
-    shapes += `<text x="${xOf(index)}" y="${height - 16}" text-anchor="middle" font-size="11" fill="#14262c" data-drill="${esc(name)}">${esc(name)}</text>`;
-  });
+  shapes += labels.marks;
   return `<svg viewBox="0 0 ${width} ${height}">${shapes}</svg>`;
 }
 
 function dualChart(chart) {
   const width = 640;
-  const height = 280;
-  const plot = { l: 54, r: 48, t: 12, b: 48 };
-  const innerW = width - plot.l - plot.r;
-  const innerH = height - plot.t - plot.b;
+  const plot = { l: 54, r: 52, t: 22 };
+  const innerH = 200;
   const cats = chart.categories || [];
+  const innerW = width - plot.l - plot.r;
+  const band = innerW / Math.max(cats.length, 1);
+  const xOf = (index) => plot.l + band * index + band / 2;
+  const labels = categoryLabels(cats, xOf, plot.t + innerH);
+  const height = plot.t + innerH + labels.depth;
   const bars = chart.bars || [];
   const line = chart.line || { values: [] };
   const left = scale(bars.flatMap((item) => item.values || []));
-  const rightVals = (line.values || []).filter((value) => value != null);
-  const rightMin = Math.min(0, ...rightVals);
-  const rightMax = Math.max(1, ...rightVals) * 1.1;
+  const right = scale(line.values || [], (line.format || "pct") === "pct");
   const yLeft = (value) => plot.t + ((left.max - value) / (left.max - left.min)) * innerH;
-  const yRight = (value) => plot.t + ((rightMax - value) / (rightMax - rightMin)) * innerH;
-  const band = innerW / Math.max(cats.length, 1);
+  const yRight = (value) => plot.t + ((right.max - value) / (right.max - right.min)) * innerH;
   const group = band * 0.62;
   const barW = group / Math.max(bars.length, 1);
   let shapes = axis(left.min, left.max, "money", width - plot.r, plot, innerH);
+  for (let i = 0; i <= 4; i += 1) {
+    const value = right.min + ((right.max - right.min) * i) / 4;
+    const y = plot.t + ((right.max - value) / (right.max - right.min)) * innerH;
+    shapes += `<text x="${width - 6}" y="${y + 3}" text-anchor="end" font-size="10" fill="#b42318">${esc(formatY(value, line.format || "pct"))}</text>`;
+  }
   cats.forEach((name, index) => {
     const cx = plot.l + band * index + band / 2;
     bars.forEach((item, seriesIndex) => {
@@ -177,11 +234,11 @@ function dualChart(chart) {
       const y = yLeft(value);
       shapes += `<rect x="${x}" y="${Math.min(y, zero)}" width="${Math.max(barW - 2, 1)}" height="${Math.abs(y - zero)}" fill="${COLORS[seriesIndex % COLORS.length]}" />`;
     });
-    shapes += `<text x="${cx}" y="${height - 16}" text-anchor="middle" font-size="11" fill="#14262c">${esc(name)}</text>`;
   });
+  shapes += labels.marks;
   const pts = (line.values || []).map((value, index) => (value == null ? null : `${plot.l + band * index + band / 2},${yRight(value)}`)).filter(Boolean);
   shapes += `<polyline fill="none" stroke="#b42318" stroke-width="2" points="${pts.join(" ")}" />`;
-  shapes += `<text x="${width - 6}" y="14" text-anchor="end" font-size="10" fill="#b42318">${esc(line.name || "")}</text>`;
+  shapes += `<text x="${width - 6}" y="12" text-anchor="end" font-size="10" fill="#b42318">${esc(line.name || "")}</text>`;
   return `<svg viewBox="0 0 ${width} ${height}">${shapes}</svg>`;
 }
 
@@ -281,26 +338,112 @@ function hbar(chart) {
   return wrap;
 }
 
+function sortNumber(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw || raw === "—") return null;
+  const part = raw.includes("→") ? raw.split("→").pop() : raw;
+  const cleaned = part.replace(/,/g, "").trim().replace(/(元|%|pp|天)$/, "");
+  if (!/^[+-]?\d+(?:\.\d+)?$/.test(cleaned)) return null;
+  return Number(cleaned);
+}
+
+function sortTableRows(rows, key, direction) {
+  const compare = (left, right) => {
+    if (left == null && right == null) return 0;
+    if (left == null) return 1;
+    if (right == null) return -1;
+    return (left - right) * direction;
+  };
+  const hasTotal = rows.some((row) => row["月份"] === "区间合计" && row["范围"]);
+  if (!hasTotal) return rows.slice().sort((a, b) => compare(sortNumber(a[key]), sortNumber(b[key])));
+  const groups = [];
+  const index = new Map();
+  rows.forEach((row) => {
+    const name = row["范围"] ?? "";
+    if (!index.has(name)) {
+      index.set(name, groups.length);
+      groups.push([]);
+    }
+    groups[index.get(name)].push(row);
+  });
+  groups.sort((a, b) => {
+    const totalOf = (group) => group.find((row) => row["月份"] === "区间合计") || group[group.length - 1];
+    return compare(sortNumber(totalOf(a)[key]), sortNumber(totalOf(b)[key]));
+  });
+  return groups.flat();
+}
+
 function tableEl(columns, rows) {
   const table = document.createElement("table");
-  table.innerHTML = `<thead><tr>${(columns || []).map((col) => `<th>${esc(col.label)}</th>`).join("")}</tr></thead>`;
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
   const body = document.createElement("tbody");
-  (rows || []).forEach((row) => {
-    const tr = document.createElement("tr");
-    tr.innerHTML = (columns || []).map((col) => `<td>${esc(row[col.key])}</td>`).join("");
-    body.appendChild(tr);
-  });
-  table.appendChild(body);
+  const source = rows || [];
+  const sortable = new Set((columns || []).filter((col) => source.some((row) => sortNumber(row[col.key]) != null)).map((col) => col.key));
+  const state = { key: null, direction: -1 };
+
+  function paint() {
+    headRow.replaceChildren();
+    (columns || []).forEach((col) => {
+      const cell = document.createElement("th");
+      if (sortable.has(col.key)) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "sort";
+        const mark = state.key === col.key ? (state.direction < 0 ? " ↓" : " ↑") : " ↕";
+        button.textContent = `${col.label}${mark}`;
+        button.setAttribute("aria-sort", state.key === col.key ? (state.direction < 0 ? "descending" : "ascending") : "none");
+        button.addEventListener("click", () => {
+          state.direction = state.key === col.key ? -state.direction : -1;
+          state.key = col.key;
+          paint();
+        });
+        cell.appendChild(button);
+      } else {
+        cell.textContent = col.label;
+      }
+      headRow.appendChild(cell);
+    });
+    const ordered = state.key ? sortTableRows(source, state.key, state.direction) : source;
+    body.replaceChildren();
+    ordered.forEach((row) => {
+      const tr = document.createElement("tr");
+      (columns || []).forEach((col) => {
+        const td = document.createElement("td");
+        if (col.drill === "customer" && row[col.key]) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "drill";
+          button.textContent = row[col.key];
+          button.addEventListener("click", () => {
+            const name = row._客户 || String(row[col.key]).replace(/（[^）]*）$/, "");
+            const month = row["月份"] && row["月份"] !== "区间合计" ? `在${row["月份"]}` : "";
+            ask(`按SKU展示${name}${month}的销售和回款`);
+          });
+          td.appendChild(button);
+        } else {
+          td.textContent = row[col.key] ?? "";
+        }
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+  }
+
+  head.appendChild(headRow);
+  table.append(head, body);
+  paint();
   return table;
 }
 
 function renderReport(data) {
   const root = $("#report");
   root.innerHTML = "";
+  root.scrollTop = 0;
   const scope = document.createElement("div");
   scope.className = "scope-row";
   const label = document.createElement("span");
-  label.textContent = `范围：${data.filters?.label || "公司合计"} · ${data.period_label || ""} vs ${data.compare_label || ""}`;
+  label.textContent = `范围：${data.filters?.label || "公司合计"} · ${data.period_label || ""}${data.compare_label ? ` vs ${data.compare_label}` : ""}`;
   scope.appendChild(label);
   if (data.question_id !== "p0_main") {
     const back = document.createElement("button");
@@ -312,30 +455,31 @@ function renderReport(data) {
   }
   root.appendChild(scope);
 
+  const sentences = data.conclusion?.sentences || [];
   const conclusion = document.createElement("section");
   conclusion.className = "conclusion";
   const copy = document.createElement("div");
-  (data.conclusion?.sentences || []).forEach((sentence) => {
+  sentences.forEach((sentence) => {
     const p = document.createElement("p");
     p.textContent = sentence.text;
     if (sentence.provenance) p.appendChild(sourceButton(sentence.provenance));
     copy.appendChild(p);
   });
-  conclusion.appendChild(copy);
+  if (sentences.length) conclusion.appendChild(copy);
   if (data.view_switch) {
     const sw = document.createElement("div");
     sw.className = "switch";
     data.view_switch.options.forEach((option) => {
       const button = document.createElement("button");
       button.type = "button";
-      button.textContent = `${option.label} ${option.slice} ${option.pp_text}`;
+      button.textContent = option.label;
       button.setAttribute("aria-pressed", String(option.id === data.view_switch.current));
       button.addEventListener("click", () => ask(state.question || state.main, { view: option.id, quiet: true }));
       sw.appendChild(button);
     });
     conclusion.appendChild(sw);
   }
-  root.appendChild(conclusion);
+  if (sentences.length || data.view_switch) root.appendChild(conclusion);
 
   const kpis = document.createElement("div");
   kpis.className = "kpis";
@@ -402,7 +546,7 @@ function renderAttribution(block) {
   agents.innerHTML = "<h3>拖累代理商</h3>";
   agents.appendChild(tableEl(
     [
-      { key: "name", label: "代理商" },
+      { key: "name", label: "代理商", drill: "customer" },
       { key: "tier", label: "等级" },
       { key: "region", label: "大区" },
       { key: "pp_text", label: "贡献" },
@@ -485,20 +629,29 @@ async function ask(question, opts = {}) {
   const view = opts.view || "auto";
   state.question = text;
   state.view = view;
+  const history = state.history.slice(-6);
   if (!opts.quiet) push("user", text);
+  const pending = opts.quiet ? null : push("assistant pending", "正在分析…");
   let data;
   try {
     const response = await fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: text, period: state.period, view }),
+      body: JSON.stringify({ question: text, period: state.period, view, history }),
     });
     data = await response.json();
   } catch (error) {
+    pending?.remove();
     push("assistant", "请求失败，请确认本地服务仍在运行。");
     return;
   }
-  if (!opts.quiet) push("assistant", data.chat_reply || "暂不支持。");
+  pending?.remove();
+  if (!opts.quiet) {
+    const reply = data.chat_reply || "暂不支持。";
+    push("assistant", reply);
+    state.history.push({ role: "user", text }, { role: "assistant", text: reply });
+  }
+  else if (opts.note) push("assistant", `已按${labelMonth(state.period)}重算当前问题。`);
   if (!data.keep_report && data.supported !== false) renderReport(data);
   else if (!data.keep_report && data.conclusion) renderReport(data);
 }
@@ -530,7 +683,7 @@ async function boot() {
   });
   select.addEventListener("change", () => {
     state.period = select.value;
-    if (state.question) ask(state.question, { view: state.view });
+    if (state.question) ask(state.question, { view: state.view, quiet: true, note: true });
   });
   renderChips(meta.questions);
   $("#ask-form").addEventListener("submit", (event) => {
@@ -538,6 +691,11 @@ async function boot() {
     const input = $("#question");
     ask(input.value, { view: "auto" });
     input.value = "";
+  });
+  $("#chat-hide").addEventListener("click", () => setChatHidden(true));
+  $("#chat-show").addEventListener("click", () => setChatHidden(false));
+  $("#chat-open").addEventListener("click", () => {
+    setChatHidden(!$(".shell").classList.contains("chat-hidden"));
   });
   $("#modal-close").addEventListener("click", () => { $("#modal").hidden = true; });
   $("#modal").addEventListener("click", (event) => {

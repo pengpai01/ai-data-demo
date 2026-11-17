@@ -26,6 +26,7 @@ ZERO = Decimal("0")
 class Scope:
     region_id: str | None = None
     product_line: str | None = None
+    product_category: str | None = None
     tier: str | None = None
     customer_id: str | None = None
     cohort: str | None = None
@@ -34,6 +35,7 @@ class Scope:
         data = {
             "region_id": self.region_id,
             "product_line": self.product_line,
+            "product_category": self.product_category,
             "tier": self.tier,
             "customer_id": self.customer_id,
             "cohort": self.cohort,
@@ -101,11 +103,14 @@ def match_row(store: Store, row: dict, scope: Scope, ym: str) -> bool:
         return False
     if scope.customer_id and row["customer_id"] != scope.customer_id:
         return False
-    if scope.product_line:
+    if scope.product_line or scope.product_category:
         product_id = row.get("product_id") or ""
-        if not product_id:
+        product = store.products.get(product_id) if product_id else None
+        if product is None:
             return False
-        if store.products[product_id]["product_line"] != scope.product_line:
+        if scope.product_line and product["product_line"] != scope.product_line:
+            return False
+        if scope.product_category and product["product_category"] != scope.product_category:
             return False
     customer = store.customers[row["customer_id"]]
     if scope.tier and customer["customer_tier"] != scope.tier:
@@ -256,7 +261,8 @@ def decompose(c0: Decimal, s0: Decimal, c1: Decimal, s1: Decimal) -> dict | None
     rate0 = c0 / s0
     rate1 = c1 / s1
     collection_effect = (c1 - c0) / s0
-    sales_effect = (c1 / s1) - (c1 / s0)
+    # Equals C1/S1 - C1/S0; taken as the remainder so the two effects add up exactly at Decimal precision.
+    sales_effect = (rate1 - rate0) - collection_effect
     return {
         "rate0": rate0,
         "rate1": rate1,
@@ -611,6 +617,8 @@ def filter_lines(store: Store, ym: str, compare: str | None, scope: Scope) -> li
     else:
         lines.append("大区=全部")
     lines.append(f"产品线={scope.product_line or '全部'}")
+    if scope.product_category:
+        lines.append(f"产品={scope.product_category}")
     lines.append(f"代理商等级={scope.tier or '全部'}")
     if scope.customer_id:
         lines.append(f"代理商={store.customers[scope.customer_id]['customer_name']}")
