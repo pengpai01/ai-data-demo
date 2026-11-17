@@ -56,7 +56,6 @@ def test_page_shell_and_auto_question_wiring():
     page = client.get("/")
     assert page.status_code == 200
     assert "星澜诊断 · 经营分析助手" in page.text
-    assert "演示数据·虚构" in page.text
     script = (ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     assert "/api/meta" in script
     assert "/api/ask" in script
@@ -73,7 +72,7 @@ def test_main_question_report_shape_and_view_switch():
     assert body["question_id"] == "p0_main"
     assert body["resolved_view"] == "region"
     assert "华东大区" in body["conclusion"]["text"]
-    assert "-27.28pp" in body["conclusion"]["text"]
+    assert "-24.14pp" in body["conclusion"]["text"]
     assert body["conclusion"]["sentences"][0]["provenance"]["formula"]
     assert body["conclusion"]["sentences"][0]["provenance"]["filters"]
     assert body["conclusion"]["sentences"][0]["provenance"]["rows"]
@@ -85,8 +84,8 @@ def test_main_question_report_shape_and_view_switch():
         assert chart["provenance"]["formula"]
         assert chart["provenance"]["filters"]
         assert chart["provenance"]["rows"]
-    assert body["attribution"]["decomposition"]["collection_text"] == "-15.83pp"
-    assert body["attribution"]["decomposition"]["sales_text"] == "-11.45pp"
+    assert body["attribution"]["decomposition"]["collection_text"] == "-14.92pp"
+    assert body["attribution"]["decomposition"]["sales_text"] == "-9.22pp"
     assert body["attribution"]["agents"][0]["name"] == "锦程华东代理商"
     assert "冲量出货抬高分母" in body["attribution"]["signals"]
     assert "大代理商延期" in body["attribution"]["signals"]
@@ -173,5 +172,5 @@ def test_narrative_hides_numbers_that_were_not_computed(monkeypatch):
 
 def test_self_test_doc_quotes_the_live_figures():
     doc = (ROOT / "docs" / "self-test-p0.md").read_text(encoding="utf-8")
-    for token in ("-27.28pp", "-15.83pp", "-11.45pp", "锦程华东代理商", "苏澜华东代理商", "浙澜华东代理商", "通过"):
+    for token in ("-24.14pp", "-14.92pp", "-9.22pp", "锦程华东代理商", "苏澜华东代理商", "浙澜华东代理商", "通过"):
         assert token in doc

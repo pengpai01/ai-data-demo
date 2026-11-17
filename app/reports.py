@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal, ROUND_HALF_UP
 
 from app.constants import (
@@ -25,6 +26,7 @@ from app.metrics import (
     ar_bridge,
     avg_collection_days,
     collection_amount,
+    collection_rate,
     contributions,
     customer_contribs,
     decompose,
@@ -64,7 +66,7 @@ from app.textfmt import (
     tone_of,
 )
 
-F_RATE = "销售回款率 = 统计期内实际回款额 ÷ 统计期内净销售额。环比 = 本期销售回款率 − 上期销售回款率，单位 pp。"
+F_RATE = "销售回款率 = 统计期内实际回款额 ÷ 统计期内净销售额。环比 = 本期销售回款率 − 上期销售回款率，单位 pp（两个率直接相减，不是相对变化）。"
 F_DECOMP = (
     "回款额变化贡献 =（本期回款额 − 上期回款额）÷ 上期净销售额。"
     "净销售额变化贡献 = 本期回款额 ÷ 本期净销售额 − 本期回款额 ÷ 上期净销售额。"
@@ -1245,6 +1247,83 @@ BUILDERS = {
     "growth_lag": build_growth,
     "agents": build_agents,
 }
+
+
+def try_customer_sku(store: Store, question: str, period: str, view: str = "auto") -> dict | None:
+    """Click-through from an agent row. Kept off the model so the drill is stable."""
+    match = re.fullmatch(r"按SKU展示(.+?)(?:在(\d{4})年(\d{1,2})月)?的销售和回款", question.strip())
+    if not match:
+        return None
+    name = re.sub(r"（[^）]*）$", "", match.group(1))
+    if match.group(2):
+        period = f"{match.group(2)}-{int(match.group(3)):02d}"
+    found = [row for row in store.customers.values() if row["customer_name"] == name]
+    if len(found) != 1:
+        return None
+    customer = found[0]
+    query = Query("customer_sku", "customer_sku", question.strip(), period, view)
+    compare, problem = comparable(store, period)
+    if problem:
+        return _blocked(query, problem)
+    scope = Scope(customer_id=customer["customer_id"])
+    rows = []
+    for product in store.products.values():
+        child = scope.narrow(product_line=product["product_line"], product_category=product["product_category"])
+        net1, net0 = net_sales(store, period, child), net_sales(store, compare, child)
+        gross1, gross0 = gross_amount(store, period, child), gross_amount(store, compare, child)
+        col1, col0 = collection_amount(store, period, child), collection_amount(store, compare, child)
+        if net1 == net0 == gross1 == gross0 == col1 == col0 == 0:
+            continue
+        rate1, rate0 = collection_rate(store, period, child), collection_rate(store, compare, child)
+        rows.append({
+            "产品": product["product_category"],
+            "产品线": product["product_line"],
+            "净销售额": f"{money_text(net0)} → {money_text(net1)}",
+            "出库额": f"{money_text(gross0)} → {money_text(gross1)}",
+            "回款额": f"{money_text(col0)} → {money_text(col1)}",
+            "销售回款率": f"{pct_text(rate0)} → {pct_text(rate1)}",
+            "_net": net1,
+        })
+    rows.sort(key=lambda row: row["_net"], reverse=True)
+    table_rows = [{key: value for key, value in row.items() if key != "_net"} for row in rows]
+    title = f"{customer['customer_name']}（{customer['customer_tier']}级，{store.region_name[customer['region_id']]}）"
+    if table_rows:
+        top = table_rows[0]
+        text = f"{period_label(period)}{title}按产品查看。净销售额最高的是{top['产品']}（{top['净销售额']}），回款额 {top['回款额']}，销售回款率 {top['销售回款率']}。"
+    else:
+        text = f"{period_label(period)}{title}没有出库或回款记录。"
+    provenance = _prov(
+        F_NET + F_SHIP + F_COL + F_RATE,
+        _filters(store, period, compare, scope),
+        table_rows,
+    )
+    active = [row for row in rows if row["_net"] > 0]
+    chart = {
+        "id": "customer_sku",
+        "title": f"{customer['customer_name']}：各产品净销售额",
+        "type": "grouped_bar",
+        "y_format": "money",
+        "categories": [row["产品"] for row in active],
+        "series": [{"name": "净销售额", "values": [money_num(row["_net"]) for row in active]}],
+        "provenance": provenance,
+    }
+    table = {
+        "id": "customer_sku_table",
+        "title": f"{customer['customer_name']}：按产品的销售与回款",
+        "type": "table",
+        "columns": [{"key": key, "label": key} for key in ("产品", "产品线", "净销售额", "出库额", "回款额", "销售回款率")],
+        "rows": table_rows,
+        "provenance": provenance,
+    }
+    packed = _pack(
+        query, store, compare, scope, _say(text, provenance),
+        build_kpis(store, period, compare, scope),
+        [chart, table] if active else [table],
+        None,
+        f"已按产品列出{customer['customer_name']}的净销售额、出库额、回款额和销售回款率。表头可排序。",
+    )
+    packed["filters"]["label"] = title
+    return packed
 
 
 def comparable(store: Store, ym: str) -> tuple[str | None, str | None]:
