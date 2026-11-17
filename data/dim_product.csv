@@ -1,0 +1,10 @@
+product_id,product_line,product_category,sku,unit
+P-R-BIO,试剂,生化试剂,XL-生化试剂盒-阿尔法,盒
+P-R-IMU,试剂,免疫试剂,XL-免疫试剂-贝塔,人份
+P-R-MOL,试剂,分子试剂,XL-核酸试剂-伽马,人份
+P-I-ANA,仪器,生化分析仪,XL-2000全自动生化分析仪,台
+P-I-LUM,仪器,化学发光仪,XL-流明化学发光分析仪,台
+P-I-HEM,仪器,血球分析仪,XL-血细胞分析仪,台
+P-S-INS,服务,装机服务,XL-装机调试服务,次
+P-S-MNT,服务,维保服务,XL-年度维保服务,次
+P-S-TRN,服务,应用培训,XL-应用培训服务,次

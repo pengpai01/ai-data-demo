@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>星澜诊断 · 经营分析助手</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">星澜诊断 · 经营分析助手</div>
+    <label class="period">
+      期间
+      <select id="period" aria-label="期间"></select>
+    </label>
+    <span class="badge">演示数据·虚构</span>
+  </header>
+  <main class="shell">
+    <section class="report" id="report" aria-live="polite">
+      <p class="placeholder">正在计算上个月的销售回款率…</p>
+    </section>
+    <section class="chat">
+      <div class="chat-head">
+        <strong>对话</strong>
+        <span>追问会更新左侧报告</span>
+      </div>
+      <div id="messages" class="messages"></div>
+      <div id="chips" class="chips"></div>
+      <form id="ask-form" class="ask">
+        <input id="question" name="question" autocomplete="off" placeholder="追问探数，例如：华东主要是哪些代理商在拖累？" />
+        <button type="submit">发送</button>
+      </form>
+    </section>
+  </main>
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <header>
+        <h2 id="modal-title">数字从哪来</h2>
+        <button type="button" id="modal-close">关闭</button>
+      </header>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
