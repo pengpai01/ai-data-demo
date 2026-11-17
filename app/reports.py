@@ -530,13 +530,13 @@ def build_main(store, query, compare, scope):
         "options": [
             {
                 "id": "region",
-                "label": "大区视角",
+                "label": "产品视角",
                 "slice": "—" if region_best is None else f"{region_best['name']}大区",
                 "pp_text": "—" if region_best is None else pp_text(region_best["delta"]),
             },
             {
                 "id": "product",
-                "label": "产品线视角",
+                "label": "大区视角",
                 "slice": "—" if product_best is None else product_best["name"],
                 "pp_text": "—" if product_best is None else pp_text(product_best["delta"]),
             },
