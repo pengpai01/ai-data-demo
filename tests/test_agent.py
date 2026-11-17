@@ -138,6 +138,14 @@ def test_reply_with_invented_numbers_is_dropped(monkeypatch):
     assert "已不展示" in reply["chat_reply"]
     assert reply["charts"][-1]["type"] == "table"
 
+def test_question_numbers_are_not_treated_as_cited(monkeypatch):
+    args = {"metrics": ["net_sales"], "region": "西北"}
+    _scripted(monkeypatch, [_tool_call("query_metrics", args), {"role": "assistant", "content": "约 1600 万元"}])
+    reply = agent.answer(STORE, "是不是卖了 1600 万", "2026-10")
+    assert "1600" not in reply["chat_reply"]
+    assert "已不展示" in reply["chat_reply"]
+    assert reply["charts"][-1]["type"] == "table"
+
 
 def test_model_reject_is_unsupported(monkeypatch):
     _scripted(monkeypatch, [_tool_call("reject", {"reason": "没有预测数据。"})])

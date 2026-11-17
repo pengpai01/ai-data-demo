@@ -661,7 +661,7 @@ def _finish(store: Store, question: str, period: str, view: str, text: str, quer
             return {**_blocked(Query("free", "free_chat", question, period, view), text), "supported": True}
         return _blocked(Query("unsupported", "unsupported", question, period, view),
                         "暂不支持。这个问题超出当前业务地图（销售回款率、大区、产品线、代理商等级、账龄）。")
-    sheet = json.dumps([item["result"] for item in queries], ensure_ascii=False) + question
+    sheet = json.dumps([item["result"] for item in queries], ensure_ascii=False)
     if not text or unknown_numbers(text, sheet):
         text = f"已在左侧列出计算结果（{queries[-1]['title']} · {queries[-1]['result']['窗口']}）。模型的文字说明引用了计算结果里没有的数字，已不展示。" if text else \
             f"已在左侧列出计算结果（{queries[-1]['title']} · {queries[-1]['result']['窗口']}）。"
