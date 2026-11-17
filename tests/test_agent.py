@@ -4,6 +4,7 @@ import json
 from decimal import Decimal
 
 from app import agent
+from app.metrics import Scope, net_sales
 from app.store import load_store
 
 STORE = load_store()
@@ -63,6 +64,72 @@ def test_ranked_agent_uses_the_row_month_when_drilling():
     assert reply["period"] == "2026-10"
     table = next(chart for chart in reply["charts"] if chart["type"] == "table")
     assert table["columns"][0]["label"] == "产品"
+
+
+def test_customer_drop_is_a_table_of_the_largest_net_sales_decline():
+    result = agent.run_query(
+        STORE,
+        {"metrics": ["net_sales"], "group_by": "customer", "order": "drop", "start_month": "2026-09", "end_month": "2026-10", "top_n": 3},
+        "2026-10",
+    )
+    rows = result["result"]["数据"]
+    assert [row["排名"] for row in rows] == ["1", "2", "3"]
+    assert rows[0]["期初"] == "2026年9月" and rows[0]["期末"] == "2026年10月"
+
+    def yuan(text):
+        return Decimal(text.replace(",", "").replace("+", "").removesuffix("元"))
+
+    changes = [yuan(row["净销售额变动"]) for row in rows]
+    assert changes == sorted(changes)
+    assert changes[0] < 0
+    for row in rows:
+        assert yuan(row["净销售额变动"]) == yuan(row["期末净销售额"]) - yuan(row["期初净销售额"])
+
+    worst_name = None
+    worst = None
+    worst_id = ""
+    for customer in STORE.customers.values():
+        scope = Scope(customer_id=customer["customer_id"])
+        delta = net_sales(STORE, "2026-10", scope) - net_sales(STORE, "2026-09", scope)
+        if worst is None or (delta, customer["customer_id"]) < (worst, worst_id):
+            worst, worst_id, worst_name = delta, customer["customer_id"], customer["customer_name"]
+    assert rows[0]["_客户"] == worst_name
+    assert [chart["type"] for chart in agent._charts(result)] == ["table"]
+
+    level = agent.run_query(STORE, {"metrics": ["net_sales"], "group_by": "customer", "top_n": 5}, "2026-10")
+    assert "hbar" in [chart["type"] for chart in agent._charts(level)]
+
+
+def test_half_year_agent_ranking_uses_the_window_total_and_only_a_table():
+    result = agent.run_query(
+        STORE,
+        {"metrics": ["net_sales"], "region": "华北", "group_by": "customer", "start_month": "2026-05", "end_month": "2026-10", "top_n": 3},
+        "2026-10",
+    )
+    rows = result["result"]["数据"]
+    assert [row["排名"] for row in rows] == ["1", "2", "3"]
+    assert rows[0]["期初"] == "2026年5月" and rows[0]["期末"] == "2026年10月"
+    assert "月份" not in rows[0]
+
+    def yuan(text):
+        return Decimal(text.replace(",", "").removesuffix("元"))
+
+    totals = [yuan(row["净销售额区间合计"]) for row in rows]
+    assert totals == sorted(totals, reverse=True)
+    months = ["2026-05", "2026-06", "2026-07", "2026-08", "2026-09", "2026-10"]
+    best_name = None
+    best = None
+    best_id = ""
+    for customer in STORE.customers.values():
+        if customer["region_id"] != "R-HB":
+            continue
+        scope = Scope(customer_id=customer["customer_id"])
+        total = sum((net_sales(STORE, month, scope) for month in months), Decimal("0"))
+        if best is None or (-total, customer["customer_id"]) < (-best, best_id):
+            best, best_id, best_name = total, customer["customer_id"], customer["customer_name"]
+    assert rows[0]["_客户"] == best_name
+    assert yuan(rows[0]["净销售额区间合计"]) == best
+    assert [chart["type"] for chart in agent._charts(result)] == ["table"]
 
 
 def test_clicking_an_agent_opens_a_sku_breakdown():

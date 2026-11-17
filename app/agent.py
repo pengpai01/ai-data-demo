@@ -107,8 +107,8 @@ SYSTEM = """你是星澜诊断的经营分析助手，回答代理商销售与�
 {guide}
 2. 其他取数问题（某个范围的逐月数据、排行、对比、合计）调用 query_metrics，可多次调用；拿到结果后用中文回答 2 到 4 句。
    - 只查用户问到的指标。用户只说「销售数据」「经营数据」时，查净销售额、出库额、回款额、销售回款率。
-   - 排行或排序时，把排序依据的指标放在 metrics 第一个；工具已按它从高到低排好，直接沿用工具给的顺序和排名。
-   - 没说明排序依据的「排序」，按销售回款率排。
+   - 排行时把排序依据的指标放在 metrics 第一个，并直接沿用工具返回的排名，不要自己重排或自己算差值。比谁高用 order=value。只问本月谁最高时不要填 start_month，工具只看 end_month。问「近半年 / 某段时间销售额最好、最高、最大的代理商」时必须同时填 start_month 和 end_month，工具按区间合计从高到低排，不是只看结束月。问「下滑最大 / 下降最多 / 跌得最多」用 order=drop；问「增长最大 / 上升最多」用 order=rise。排名看「变动」列（期末减期初；金额是元，不是百分比）。跨月排行和 drop/rise 的页面只展示表格。
+   - 没说明排序依据的「排序」，按销售回款率、order=value 排。
 3. 需要本数据没有的信息（承诺回款、直营、医院或体检中心作为客户、退货、坏账、代理商库存、预测、目标或预算等），或与经营分析无关时，调用 reject 说明原因。
 
 回答规则：
@@ -145,7 +145,11 @@ TOOLS = [
                 "按月计算指标。可按大区、产品线、具体产品、等级或代理商分组。多个月时每组附「区间合计」"
                 "（金额类求和，回款率/折扣率按合计重算；余额、DSO、账龄类没有合计）。"
                 "按产品分组看一条产品线下的各个产品，建议同时给 product_line。"
-                "按代理商分组用于代理商排行，只看 end_month 一个月，按第一个指标从高到低取前 top_n 家。"
+                "按代理商分组：order=value 且只给一个月时，只看 end_month，按第一个指标从高到低取前 top_n 家。"
+                "order=value 且 start_month 早于 end_month 时，按这段时间的区间合计从高到低取前 top_n 家（金额各月相加，比率按合计重算），不是只看结束月。"
+                "order=drop 或 rise 比较 start_month 与 end_month（省略或与 end 相同则与上月比），"
+                "按第一个指标的变动取前 top_n 家：drop 是下滑最大（变动最小），rise 是增长最大。"
+                "金额的变动是期末减期初的元；百分比在环比列，不作为 drop/rise 的排序依据。"
                 "看某一家代理商或某一个产品的逐月数据时，用 customer 或 product 参数并且不分组。"
             ),
             "parameters": {
@@ -160,6 +164,11 @@ TOOLS = [
                     "tier": {"type": "string", "enum": list(TIER_ORDER)},
                     "customer": {"type": "string", "description": "代理商名称"},
                     "group_by": {"type": "string", "enum": ["none", "region", "product_line", "product", "tier", "customer"]},
+                    "order": {
+                        "type": "string",
+                        "enum": ["value", "drop", "rise"],
+                        "description": "value：单月按该月数值从高到低，跨月按区间合计从高到低。drop 按变动从小到大（下滑最大在前）；rise 按变动从大到小。drop 和 rise 仅用于 group_by=customer。",
+                    },
                     "top_n": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
                 "required": ["metrics"],
@@ -258,6 +267,19 @@ def _text(kind: str, value: Decimal | None) -> str:
     return days_text(value)
 
 
+def _delta_text(kind: str, prev: Decimal | None, cur: Decimal | None) -> str:
+    """Signed change from the window start to the window end. Money is yuan, not a ratio."""
+    if prev is None or cur is None:
+        return "—"
+    delta = cur - prev
+    if kind == "money":
+        text = money_text(delta)
+        return f"+{text}" if delta > 0 else text
+    if kind == "pct":
+        return pp_text(delta)
+    return days_signed(delta)
+
+
 def _change(kind: str, prev: Decimal | None, cur: Decimal | None) -> str:
     """Amounts: relative change; rates: pp; days: day difference."""
     if prev is None or cur is None:
@@ -349,6 +371,11 @@ def run_query(store: Store, args: dict, period: str) -> dict:
     group_by = args.get("group_by") or "none"
     if customer and group_by == "customer":
         group_by = "none"
+    order = args.get("order") or "value"
+    if order not in {"value", "drop", "rise"}:
+        raise ToolError("order 只能是 value、drop 或 rise")
+    if order != "value" and group_by != "customer":
+        raise ToolError("order=drop 或 rise 只用于按代理商分组")
     notes = []
     if group_by == "region":
         groups = [(f"{REGION_LABEL[rid]}大区", base.narrow(region_id=rid)) for rid in REGION_ORDER if not base.region_id or base.region_id == rid]
@@ -365,8 +392,15 @@ def run_query(store: Store, args: dict, period: str) -> dict:
     elif group_by == "tier":
         groups = [(f"{name}级代理商", base.narrow(tier=name)) for name in TIER_ORDER if not base.tier or base.tier == name]
     elif group_by == "customer":
-        months = [end]
         top_n = max(1, min(int(args.get("top_n") or 10), 20))
+        if order == "value":
+            if start == end:
+                months = [end]
+        else:
+            anchor = start if start != end else shift_month(end, -1)
+            if anchor < DATA_START or anchor > DATA_END:
+                raise ToolError(f"{period_label(end)}没有可比较的上一期")
+            months = [anchor, end]
         candidates = []
         for row in store.customers.values():
             if base.region_id and row["region_id"] != base.region_id:
@@ -376,13 +410,40 @@ def run_query(store: Store, args: dict, period: str) -> dict:
             if base.customer_id and row["customer_id"] != base.customer_id:
                 continue
             scope = base.narrow(customer_id=row["customer_id"])
-            value = _metric_value(store, keys[0], months, scope)
-            if value is not None:
-                candidates.append((value, row, scope))
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        groups = [(f"{row['customer_name']}（{REGION_LABEL[row['region_id']]}·{row['customer_tier']}级）", scope) for _, row, scope in candidates[:top_n]]
-        customer_names = {label: row["customer_name"] for (_, row, _), (label, _) in zip(candidates[:top_n], groups)}
-        notes.append(f"按代理商分组只看 {period_label(end)}，按{METRICS[keys[0]][0]}从高到低取前 {len(groups)} 家（共 {len(candidates)} 家有数）。")
+            if order == "value":
+                value = _metric_value(store, keys[0], months, scope)
+                if value is None:
+                    continue
+                candidates.append((value, row["customer_id"], row, scope))
+            else:
+                opened = _metric_value(store, keys[0], [anchor], scope)
+                closed = _metric_value(store, keys[0], [end], scope)
+                if opened is None or closed is None or (opened == 0 and closed == 0):
+                    continue
+                candidates.append((closed - opened, row["customer_id"], row, scope))
+        if order == "value":
+            candidates.sort(key=lambda item: (-item[0], item[1]))
+        elif order == "drop":
+            candidates.sort(key=lambda item: (item[0], item[1]))
+        else:
+            candidates.sort(key=lambda item: (-item[0], item[1]))
+        groups = [(f"{row['customer_name']}（{REGION_LABEL[row['region_id']]}·{row['customer_tier']}级）", scope) for _, _, row, scope in candidates[:top_n]]
+        customer_names = {label: row["customer_name"] for (_, _, row, _), (label, _) in zip(candidates[:top_n], groups)}
+        metric_name = METRICS[keys[0]][0]
+        if order == "value" and len(months) == 1:
+            notes.append(f"按代理商分组只看 {period_label(end)}，按{metric_name}从高到低取前 {len(groups)} 家（共 {len(candidates)} 家有数）。")
+        elif order == "value":
+            notes.append(
+                f"按代理商分组看 {period_label(months[0])}至{period_label(months[-1])}的区间合计，"
+                f"按{metric_name}从高到低取前 {len(groups)} 家（共 {len(candidates)} 家有数）。"
+                "金额是各月相加，比率按合计重算，不是结束月单月的数。"
+            )
+        else:
+            direction = "从小到大（负得越多，下滑越大）" if order == "drop" else "从大到小（增得越多，增长越大）"
+            notes.append(
+                f"已比较{period_label(anchor)}与{period_label(end)}，按{metric_name}变动{direction}取前 {len(groups)} 家"
+                f"（共 {len(candidates)} 家可比较）。变动 = 期末减期初；金额变动的单位是元，环比是相对变化，不决定这个排名。"
+            )
     else:
         group_by = "none"
         groups = [(title, base)]
@@ -391,7 +452,12 @@ def run_query(store: Store, args: dict, period: str) -> dict:
     if len(groups) * len(months) * len(keys) > MAX_CELLS:
         raise ToolError("结果太大，请缩小月份或分组")
 
-    window = f"{period_label(months[0])}至{period_label(months[-1])}，共 {len(months)} 个月" if len(months) > 1 else period_label(months[0])
+    if group_by == "customer" and order != "value":
+        window = f"{period_label(months[0])}与{period_label(months[-1])}相比"
+    elif len(months) > 1:
+        window = f"{period_label(months[0])}至{period_label(months[-1])}，共 {len(months)} 个月"
+    else:
+        window = period_label(months[0])
     matrix = {}
     for label, scope in groups:
         matrix[label] = {key: [_metric_value(store, key, [month], scope) for month in months] for key in keys}
@@ -407,25 +473,50 @@ def run_query(store: Store, args: dict, period: str) -> dict:
         span = "区间合计" if len(months) > 1 else period_label(months[0])
         notes.append(f"已按{span}的{METRICS[keys[0]][0]}从高到低排序。点击表头可改按其他列排序。")
     rows = []
-    for rank, (label, scope) in enumerate(groups, start=1):
-        for index, month in enumerate(months):
-            row = {"排名": str(rank)} if len(months) == 1 and len(groups) > 1 else {}
-            row.update({"范围": label, "月份": period_label(month)})
+    if group_by == "customer" and order != "value":
+        for rank, (label, _scope) in enumerate(groups, start=1):
+            row = {"排名": str(rank), "范围": label, "期初": period_label(months[0]), "期末": period_label(months[-1])}
             if label in customer_names:
                 row["_客户"] = customer_names[label]
             for key in keys:
                 kind = METRICS[key][1]
-                series = matrix[label][key]
-                row[METRICS[key][0]] = _text(kind, series[index])
-                if len(months) > 1:
-                    row[f"{METRICS[key][0]}环比"] = "—" if index == 0 else _change(kind, series[index - 1], series[index])
+                name = METRICS[key][0]
+                opened, closed = matrix[label][key]
+                row[f"期初{name}"] = _text(kind, opened)
+                row[f"期末{name}"] = _text(kind, closed)
+                row[f"{name}变动"] = _delta_text(kind, opened, closed)
+                if kind == "money":
+                    row[f"{name}环比"] = _change(kind, opened, closed)
             rows.append(row)
-        if len(months) > 1:
-            row = {"范围": label, "月份": "区间合计"}
+    elif group_by == "customer" and len(months) > 1:
+        for rank, (label, scope) in enumerate(groups, start=1):
+            row = {"排名": str(rank), "范围": label, "期初": period_label(months[0]), "期末": period_label(months[-1])}
+            if label in customer_names:
+                row["_客户"] = customer_names[label]
             for key in keys:
-                row[METRICS[key][0]] = _text(METRICS[key][1], _metric_value(store, key, months, scope))
-                row[f"{METRICS[key][0]}环比"] = "—"
+                kind = METRICS[key][1]
+                row[f"{METRICS[key][0]}区间合计"] = _text(kind, _metric_value(store, key, months, scope))
             rows.append(row)
+    else:
+        for rank, (label, scope) in enumerate(groups, start=1):
+            for index, month in enumerate(months):
+                row = {"排名": str(rank)} if len(months) == 1 and len(groups) > 1 else {}
+                row.update({"范围": label, "月份": period_label(month)})
+                if label in customer_names:
+                    row["_客户"] = customer_names[label]
+                for key in keys:
+                    kind = METRICS[key][1]
+                    series = matrix[label][key]
+                    row[METRICS[key][0]] = _text(kind, series[index])
+                    if len(months) > 1:
+                        row[f"{METRICS[key][0]}环比"] = "—" if index == 0 else _change(kind, series[index - 1], series[index])
+                rows.append(row)
+            if len(months) > 1:
+                row = {"范围": label, "月份": "区间合计"}
+                for key in keys:
+                    row[METRICS[key][0]] = _text(METRICS[key][1], _metric_value(store, key, months, scope))
+                    row[f"{METRICS[key][0]}环比"] = "—"
+                rows.append(row)
 
     return {
         "result": {"范围": title, "窗口": window, "分组": group_by, "说明": notes, "数据": rows},
@@ -436,6 +527,8 @@ def run_query(store: Store, args: dict, period: str) -> dict:
         "scope": base,
         "title": title,
         "group_by": group_by,
+        "order": order,
+        "table_only": group_by == "customer" and (order != "value" or len(months) > 1),
         "filters": [f"范围={title}", f"月份={window}", f"分组={group_by}"],
         "formulas": [METRICS[key][2] for key in keys],
     }
@@ -446,7 +539,9 @@ def _charts(query: dict) -> list[dict]:
     labels = [period_label(month) for month in months]
     prov = _prov(" ".join(dict.fromkeys(query["formulas"])), query["filters"], query["result"]["数据"][:80])
     charts = []
-    if len(months) > 1 and len(groups) == 1:
+    if query.get("table_only"):
+        pass
+    elif len(months) > 1 and len(groups) == 1:
         for kind in ("money", "pct", "days"):
             picked = [key for key in keys if METRICS[key][1] == kind]
             if not picked:
