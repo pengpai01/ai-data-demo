@@ -417,7 +417,8 @@ function tableEl(columns, rows) {
           button.textContent = row[col.key];
           button.addEventListener("click", () => {
             const name = row._客户 || String(row[col.key]).replace(/（[^）]*）$/, "");
-            const month = row["月份"] && row["月份"] !== "区间合计" ? `在${row["月份"]}` : "";
+            const monthLabel = row["月份"] && row["月份"] !== "区间合计" ? row["月份"] : (row["期末"] || "");
+            const month = monthLabel ? `在${monthLabel}` : "";
             ask(`按SKU展示${name}${month}的销售和回款`);
           });
           td.appendChild(button);
