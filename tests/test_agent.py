@@ -97,7 +97,7 @@ def test_customer_drop_is_a_table_of_the_largest_net_sales_decline():
     assert [chart["type"] for chart in agent._charts(result)] == ["table"]
 
     level = agent.run_query(STORE, {"metrics": ["net_sales"], "group_by": "customer", "top_n": 5}, "2026-10")
-    assert "hbar" in [chart["type"] for chart in agent._charts(level)]
+    assert [chart["type"] for chart in agent._charts(level)] == ["table"]
 
 
 def test_half_year_agent_ranking_uses_the_window_total_and_only_a_table():
@@ -167,6 +167,81 @@ def test_single_customer_ignores_customer_grouping():
     assert result["title"] == "锦程华东代理商"
 
 
+def test_agent_count_is_a_table_and_a_sentence_without_a_chart():
+    result = agent.run_query(STORE, {"metrics": ["customer_count"], "group_by": "region"}, "2026-10")
+    rows = result["result"]["数据"]
+    assert [row["范围"] for row in rows] == ["华东大区", "华南大区", "华北大区", "西南大区", "西北大区", "合计"]
+    assert [row["代理商数量"] for row in rows] == ["26家", "24家", "24家", "23家", "23家", "120家"]
+    assert [chart["type"] for chart in agent._charts(result)] == ["table"]
+
+    reply = agent.answer(STORE, "公司有多少家代理商", "2026-10")
+    assert reply["kpis"] == []
+    assert [chart["type"] for chart in reply["charts"]] == ["table"]
+    assert reply["compare_label"] == ""
+    assert "共120家" in reply["chat_reply"]
+    assert reply["conclusion"]["sentences"][0]["text"] == reply["chat_reply"]
+    assert "净销售额" not in reply["chat_reply"]
+
+
+def test_agents_per_region_is_a_count_table():
+    reply = agent.answer(STORE, "每个大区有多少家代理商", "2026-10")
+    assert reply["supported"] is True
+    assert "暂不支持" not in reply["chat_reply"]
+    assert "华东大区26家" in reply["chat_reply"]
+    assert "共120家" in reply["chat_reply"]
+    assert [chart["type"] for chart in reply["charts"]] == ["table"]
+    assert reply["charts"][0]["rows"][-1] == {"范围": "合计", "月份": "2026年10月", "代理商数量": "120家"}
+
+    by_line = agent.answer(STORE, "每个产品线有多少家代理商", "2026-10")
+    assert [row["范围"] for row in by_line["charts"][0]["rows"]] == ["试剂产品线", "仪器产品线", "服务产品线"]
+    assert "暂不支持" not in by_line["chat_reply"]
+
+
+def test_agent_roster_is_names_by_region_without_rank_or_chart():
+    reply = agent.answer(STORE, "公司每个大区的代理商的列表", "2026-10")
+    assert reply["supported"] is True
+    assert reply["kpis"] == []
+    assert reply["compare_label"] == ""
+    assert reply["page"] == "sheet"
+    assert reply["page_title"] == "代理商名单"
+    assert reply["period_label"] == "代理商名录"
+    assert [chart["type"] for chart in reply["charts"]] == ["table"]
+    table = reply["charts"][0]
+    assert [column["label"] for column in table["columns"]] == ["大区", "代理商", "等级"]
+    assert len(table["rows"]) == 120
+    assert "排名" not in table["rows"][0]
+    assert "净销售额" not in table["rows"][0]
+    order = ["华东大区", "华南大区", "华北大区", "西南大区", "西北大区"]
+    names = [row["大区"] for row in table["rows"]]
+    assert names == sorted(names, key=order.index)
+    assert names.count("华东大区") == 26
+    assert "共120家" in reply["chat_reply"]
+    assert "排名" not in reply["chat_reply"]
+
+    blocked = agent.answer(STORE, "华东主要是哪些代理商在拖累？", "2026-10")
+    assert blocked["question_id"] == "follow_agents"
+
+
+def test_each_agent_sales_by_region_is_the_full_october_table():
+    reply = agent.answer(STORE, "显示一下全国各大区下各代理商10月的销售情况", "2026-10")
+    assert reply["page"] == "sheet"
+    assert reply["page_title"] == "2026年10月各代理商销售"
+    assert "前20" not in reply["chat_reply"]
+    assert "前 20" not in reply["chat_reply"]
+    table = reply["charts"][0]
+    assert [column["label"] for column in table["columns"]] == ["大区", "代理商", "净销售额", "出库额", "回款额", "销售回款率"]
+    assert len(table["rows"]) == 120
+    assert "排名" not in table["rows"][0]
+    east = [row for row in table["rows"] if row["大区"] == "华东大区"]
+    assert len(east) == 26
+    assert east[0]["代理商"] == "锦程华东代理商"
+    assert east[0]["净销售额"] == "5,236,560.00元"
+    assert east[0]["销售回款率"] == "49.57%"
+    shantou = next(row for row in table["rows"] if row["代理商"] == "潮汕华南代理商")
+    assert shantou["销售回款率"] == "131.98%"
+    assert agent.try_region_agent_sales(STORE, "净销售额最高的代理商", "2026-10", "auto") is None
+
+
 def test_without_key_the_keyword_router_answers():
     reply = agent.answer(STORE, "华东主要是哪些代理商在拖累？", "2026-10")
     assert reply["question_id"] == "follow_agents"
@@ -191,9 +266,11 @@ def test_reply_with_traceable_numbers_is_kept(monkeypatch):
     _scripted(monkeypatch, [_tool_call("query_metrics", args), {"role": "assistant", "content": "西北大区区间合计净销售额 95,852,706.00元。"}])
     reply = agent.answer(STORE, "展示西北大区近半年的销售数据", "2026-10")
     assert reply["question_id"] == "free_query"
-    assert reply["conclusion"] is None
+    assert reply["page"] == "sheet"
+    assert reply["kpis"] == []
     assert reply["chat_reply"] == "西北大区区间合计净销售额 95,852,706.00元。"
-    assert any(chart["type"] == "line" for chart in reply["charts"])
+    assert reply["conclusion"]["sentences"][0]["text"] == reply["chat_reply"]
+    assert [chart["type"] for chart in reply["charts"]] == ["table"]
     assert reply["period_label"] == "2026年5月至2026年10月"
 
 
