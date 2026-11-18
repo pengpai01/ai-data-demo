@@ -163,6 +163,7 @@ SYSTEM = """你是星澜诊断的经营分析助手，回答代理商销售与�
    - 问有多少家代理商、某大区或某等级有几家时，metrics 只填 customer_count，不要用净销售额来数人数。公司整体用 group_by=region。家数没有对应的图，页面只展示表格和这句话。
    - 问代理商名单、列表、有哪些代理商时，调用 list_customers。客户维度只有大区、名称、等级。不要查销售额或回款，不要排名，不要图表，也不要补账期、产品线等没问到的字段。
    - 问各大区下每一家代理商的销售、不是问谁最高或前几名时，不要用 top_n 截成前 20，也不要按回款率再排一次名。按大区列出全部代理商的净销售额、出库额、回款额、销售回款率。
+   - 问各大区各自的前几名时，五个大区都要查，每个大区查一次，top_n 等于问句里的名次。不要只查其中两个大区，也不要改成全国总榜。
    - 没说明排序依据的「排序」，按销售回款率、order=value 排。
 3. 地图里还有这些取数，用 query_metrics：出库量（不能跨产品线或跨单位合计）、本期到期应收、本期新增应收、账龄金额、账龄占比、平均回款天数、活跃代理商数、回款代理商数、前5家应收集中度。过滤和分组可以用 cohort（新代理商/老代理商）和 aging_bucket（未到期、1–30、31–60、61–90、90+，账龄桶只用于应收/账龄指标）。
 4. 率变分解、交叉贡献、代理商贡献、账龄迁移、应收月环比拆解、月初月末出货对照、下降最快，对用户给出的合法父切片调用 query_relation，不要只绑在主报告上。下降最快的 5% 门槛只用于这一次评选。
@@ -1015,13 +1016,53 @@ def _open_report(store: Store, question: str, args: dict, period: str, view: str
     return BUILDERS[intent](store, query, compare, scope)
 
 
+def _combine_region_rankings(queries: list[dict]) -> dict | None:
+    """One table for a per-region ranking. Dropping all but two tables hid the other regions."""
+    if len(queries) < 2:
+        return None
+    if any(item.get("roster") or item.get("group_by") != "customer" or not item["scope"].region_id for item in queries):
+        return None
+    regions = [item["scope"].region_id for item in queries]
+    if len(regions) != len(set(regions)):
+        return None
+    signature = [
+        (tuple(item["keys"]), tuple(item["months"]), item["scope"].product_line, item["scope"].tier, item["order"])
+        for item in queries
+    ]
+    if len(set(signature)) != 1:
+        return None
+    order = {rid: index for index, rid in enumerate(REGION_ORDER)}
+    rows = []
+    for item in sorted(queries, key=lambda item: order[item["scope"].region_id]):
+        region_name = f"{REGION_LABEL[item['scope'].region_id]}大区"
+        for row in item["result"]["数据"]:
+            merged = {"大区": region_name}
+            merged.update({key: value for key, value in row.items() if not str(key).startswith("_")})
+            rows.append(merged)
+    head = queries[0]
+    return {
+        **head,
+        "result": {**head["result"], "范围": "各大区", "数据": rows},
+        "groups": [],
+        "group_by": "none",
+        "scope": Scope(product_line=head["scope"].product_line, tier=head["scope"].tier),
+        "title": "各大区",
+        "table_only": True,
+        "page_title": head.get("page_title"),
+    }
+
+
 def _free_report(store: Store, question: str, period: str, view: str, text: str, queries: list[dict]) -> dict:
-    last = queries[-1]
+    combined = _combine_region_rankings(queries)
+    shown = [combined] if combined is not None else list(queries)
+    last = shown[-1]
     months = last["months"]
     charts = []
-    for item in queries:
+    for item in shown:
         charts.extend(_charts(item))
-    charts = [chart for chart in charts if chart["type"] != "table"][: MAX_CHARTS - 1] + [chart for chart in charts if chart["type"] == "table"][:2]
+    graphics = [chart for chart in charts if chart["type"] != "table"][: MAX_CHARTS - 1]
+    tables = [chart for chart in charts if chart["type"] == "table"]
+    charts = graphics + tables
     end = months[-1]
     compare, _ = comparable(store, end)
     single = len(months) == 1
@@ -1264,6 +1305,94 @@ def _extreme_window(raw: str, end: str) -> tuple[str, str] | None:
     return end, end
 
 
+def _asked_rank_count(raw: str) -> int | None:
+    compact = re.sub(r"\s+", "", raw)
+    digit = re.search(r"前(\d+)(?:名|家|个)?", compact)
+    if digit:
+        return int(digit.group(1))
+    words = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    spoken = re.search(r"前([一二两三四五六七八九十])(?:名|家|个)?", compact)
+    if spoken:
+        return words[spoken.group(1)]
+    return None
+
+
+def try_region_top(store: Store, question: str, period: str, view: str) -> dict | None:
+    """Top N inside every region, one table. The count comes from the question."""
+    raw = question.strip()
+    if not re.search(r"各大区|每个大区|各区|分大区|按大区", raw) or "代理" not in raw:
+        return None
+    if not re.search(r"排行|排名|前", raw):
+        return None
+    if re.search(r"下滑|下降|跌|增长|上升|拖累|原因|贡献", raw):
+        return None
+    number = _asked_rank_count(raw)
+    if number is None or not 1 <= number <= 20:
+        return None
+    end = resolve_period(raw, period)
+    window = _extreme_window(raw, end)
+    if window is None or window[0] != window[1]:
+        return None
+    lines = [line for line in LINE_ORDER if line in raw]
+    if len(lines) > 1:
+        return None
+    line = lines[0] if lines else None
+    metric = primary_metric(raw) or "net_sales"
+    if metric in HEADCOUNT or metric not in METRICS:
+        return None
+    order = "low" if re.search(r"最差|最低|最少|最小|倒数", raw) else "value"
+    rows = []
+    for name, _rid in REGION_NAMES:
+        args = {
+            "metrics": [metric],
+            "group_by": "customer",
+            "order": order,
+            "top_n": number,
+            "start_month": end,
+            "end_month": end,
+            "region": name,
+        }
+        if line:
+            args["product_line"] = line
+        result = run_query(store, args, end)
+        for row in result["result"]["数据"]:
+            tier = re.search(r"·([ABC])级", row.get("范围", ""))
+            rows.append({
+                "大区": f"{name}大区",
+                "排名": row.get("排名", ""),
+                "代理商": row.get("_客户") or row.get("范围", ""),
+                "等级": f"{tier.group(1)}级" if tier else "",
+                METRICS[metric][0]: row[METRICS[metric][0]],
+            })
+    label = METRICS[metric][0]
+    line_text = f"{line}产品线" if line else "全部产品线"
+    rank_word = f"最低{number}名" if order == "low" else f"前{number}名"
+    title = f"{line_text} · 各大区"
+    reply = f"{period_label(end)}{line_text}，各大区{label}{rank_word}见下表，每个大区{number}家。"
+    result = {
+        "result": {
+            "范围": title,
+            "窗口": period_label(end),
+            "分组": "customer",
+            "说明": [f"每个大区按{label}取{number}家，不是只取其中两个大区，也不是全国总榜。"],
+            "数据": rows,
+        },
+        "keys": [metric],
+        "months": [end],
+        "groups": [],
+        "matrix": {},
+        "scope": Scope(product_line=line),
+        "title": title,
+        "group_by": "none",
+        "order": order,
+        "table_only": True,
+        "page_title": f"{period_label(end)}{line_text}各大区{rank_word}",
+        "filters": [f"范围={title}", f"月份={period_label(end)}", f"每个大区{number}家"],
+        "formulas": [METRICS[metric][2]],
+    }
+    return _free_report(store, raw, end, view, reply, [result])
+
+
 def try_agent_extreme(store: Store, question: str, period: str, view: str) -> dict | None:
     """「最差/最好的 N 家」returns exactly N rows, low or high, as a table."""
     raw = question.strip()
@@ -1398,6 +1527,9 @@ def answer(store: Store, question: str, period: str, view: str = "auto", history
     by_region = try_region_agent_sales(store, text, period, view)
     if by_region is not None:
         return by_region
+    per_region = try_region_top(store, text, period, view)
+    if per_region is not None:
+        return per_region
     extreme = try_agent_extreme(store, text, period, view)
     if extreme is not None:
         return extreme

@@ -415,6 +415,47 @@ def test_question_numbers_are_not_treated_as_cited(monkeypatch):
     assert reply["charts"][-1]["type"] == "table"
 
 
+def test_each_region_reagent_top_three_is_one_full_table():
+    expected = {f"{name}大区": [] for name, _rid in agent.REGION_NAMES}
+    for customer in STORE.customers.values():
+        scope = Scope(customer_id=customer["customer_id"], product_line="试剂")
+        expected[f"{agent.REGION_LABEL[customer['region_id']]}大区"].append(
+            (net_sales(STORE, "2026-10", scope), customer["customer_id"], customer["customer_name"])
+        )
+    for name in expected:
+        expected[name] = [item[2] for item in sorted(expected[name], key=lambda item: (-item[0], item[1]))[:3]]
+
+    reply = agent.answer(STORE, "请列出各大区试剂销售排行前三的代理", "2026-10")
+    tables = [chart for chart in reply["charts"] if chart["type"] == "table"]
+    assert reply["page"] == "sheet"
+    assert [chart["type"] for chart in reply["charts"]] == ["table"]
+    assert len(tables[0]["rows"]) == 15
+    shown = {}
+    for row in tables[0]["rows"]:
+        shown.setdefault(row["大区"], []).append(row["代理商"])
+    assert shown == expected
+    huadong = [row for row in tables[0]["rows"] if row["大区"] == "华东大区"]
+    assert huadong[0]["代理商"] == "锦程华东代理商"
+    assert huadong[0]["净销售额"] == "3,991,680.00元"
+    assert all(row["等级"] == "A级" for row in tables[0]["rows"])
+
+
+def test_split_region_queries_are_not_cut_down_to_two_tables():
+    queries = [
+        agent.run_query(
+            STORE,
+            {"metrics": ["net_sales"], "product_line": "试剂", "region": name, "group_by": "customer", "order": "value", "top_n": 3, "end_month": "2026-10"},
+            "2026-10",
+        )
+        for name, _rid in agent.REGION_NAMES
+    ]
+    reply = agent._free_report(STORE, "请列出各大区试剂销售排行前三的代理", "2026-10", "auto", "见下表。", queries)
+    tables = [chart for chart in reply["charts"] if chart["type"] == "table"]
+    assert len(tables) == 1
+    assert len(tables[0]["rows"]) == 15
+    assert {row["大区"] for row in tables[0]["rows"]} == {"华东大区", "华南大区", "华北大区", "西南大区", "西北大区"}
+
+
 def test_model_reject_is_unsupported(monkeypatch):
     _scripted(monkeypatch, [_tool_call("reject", {"reason": "没有预测数据。"})])
     reply = agent.answer(STORE, "明年华东能卖多少", "2026-10")
