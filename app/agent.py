@@ -109,7 +109,7 @@ SYSTEM = """你是星澜诊断的经营分析助手，回答代理商销售与�
 {guide}
 2. 其他取数问题（某个范围的逐月数据、排行、对比、合计）调用 query_metrics，可多次调用；拿到结果后用中文回答 2 到 4 句。
    - 只查用户问到的指标。用户只说「销售数据」「经营数据」时，查净销售额、出库额、回款额、销售回款率。
-   - 排行时把排序依据的指标放在 metrics 第一个，并直接沿用工具返回的排名，不要自己重排或自己算差值。比谁高用 order=value。只问本月谁最高时不要填 start_month，工具只看 end_month。问「最差 / 最低 / 最少 / 最小」（例如销售额最差、净销售额最低）用 order=low：只看 end_month，按该月数值从小到大取前 top_n 家。这就是最低的几家，直接引用排名和金额，不要说工具只返回从高到低的前 20 名、数据无法支持最低。order=low 是金额最小，不是跌幅，不要改用 order=drop。问了几家，top_n 就填几家。问「近半年 / 某段时间销售额最好、最高、最大的代理商」时必须同时填 start_month 和 end_month，工具按区间合计从高到低排，不是只看结束月。问「下滑最大 / 下降最多 / 跌得最多」用 order=drop；问「增长最大 / 上升最多」用 order=rise。drop 和 rise 的排名看「变动」列（期末减期初；金额是元，不是百分比）。对不上现成报告时只出表格。
+   - 排行时把排序依据的指标放在 metrics 第一个，并直接沿用工具返回的排名，不要自己重排或自己算差值。比谁高用 order=value。只问本月谁最高或谁最低时不要填 start_month，工具只看 end_month。问「最差 / 最低 / 最少 / 最小」（例如销售额最差、净销售额最低）用 order=low：只问本月时只看 end_month，按该月数值从小到大取前 top_n 家。这就是最低的几家，直接引用排名和金额，不要说工具只返回从高到低的前 20 名、数据无法支持最低。order=low 是金额最小，不是跌幅，不要改用 order=drop。问了几家，top_n 就填几家。问「近半年 / 某段时间销售额最好、最高、最大、最差、最低的代理商」时必须同时填 start_month 和 end_month：order=value 按区间合计从高到低，order=low 按区间合计从低到高，都不是只看结束月，也不要改成只查结束月再排序。问「下滑最大 / 下降最多 / 跌得最多」用 order=drop；问「增长最大 / 上升最多」用 order=rise。drop 和 rise 的排名看「变动」列（期末减期初；金额是元，不是百分比）。对不上现成报告时只出表格。
    - 问有多少家代理商、某大区或某等级有几家时，metrics 只填 customer_count，不要用净销售额来数人数。公司整体用 group_by=region。家数没有对应的图，页面只展示表格和这句话。
    - 问代理商名单、列表、有哪些代理商时，调用 list_customers。客户维度只有大区、名称、等级。不要查销售额或回款，不要排名，不要图表，也不要补账期、产品线等没问到的字段。
    - 问各大区下每一家代理商的销售、不是问谁最高或前几名时，不要用 top_n 截成前 20，也不要按回款率再排一次名。按大区列出全部代理商的净销售额、出库额、回款额、销售回款率。
@@ -152,7 +152,7 @@ TOOLS = [
                 "按产品分组看一条产品线下的各个产品，建议同时给 product_line。"
                 "按代理商分组：order=value 且只给一个月时，只看 end_month，按第一个指标从高到低取前 top_n 家。"
                 "order=low 且只给一个月时，同样只看 end_month，按第一个指标从低到高（最小在前）取前 top_n 家。"
-                "问最差、最低、最少、最小（销售额最差、净销售额最低）时必须用 order=low，按数值从小到大。问最好、最高、最大时用 order=value，从大到小。家数不固定：最差的 5 家、最差的 10 家、最好的 8 家，top_n 都等于问句里的家数，只返回这么多家。直接引用这几家，不要改用 order=drop，也不要说只返回了前 20 名、无法支持。"
+                "问最差、最低、最少、最小（销售额最差、净销售额最低）时必须用 order=low，按数值从小到大。问最好、最高、最大时用 order=value，从大到小。家数不固定：最差的 5 家、最差的 10 家、最好的 8 家，top_n 都等于问句里的家数，只返回这么多家。直接引用这几家，不要改用 order=drop，也不要说只返回了前 20 名、无法支持。问近半年或某段时间时必须同时给 start_month 和 end_month，按区间合计排，不要只填结束月、不要按结束月单月排。"
                 "order=value 且 start_month 早于 end_month 时，按这段时间的区间合计从高到低取前 top_n 家（金额各月相加，比率按合计重算），不是只看结束月。"
                 "order=low 且 start_month 早于 end_month 时，按这段时间的区间合计从低到高取前 top_n 家。"
                 "order=drop 或 rise 比较 start_month 与 end_month（省略或与 end 相同则与上月比），"
@@ -953,6 +953,44 @@ def try_region_agent_sales(store: Store, question: str, period: str, view: str) 
 
 
 
+def _extreme_window(raw: str, end: str) -> tuple[str, str] | None:
+    """Start and end months for a ranking question. None if a window is implied but unresolved."""
+    compact = re.sub(r"\s+", "", raw)
+    if re.search(r"近半年|近六个月|近6个月", compact):
+        return shift_month(end, -5), end
+    three = re.search(r"近三个月|近3个月", compact)
+    counted = re.search(r"近(\d+)个月", compact)
+    if three:
+        return shift_month(end, -2), end
+    if counted:
+        width = int(counted.group(1))
+        if width < 2:
+            return end, end
+        return shift_month(end, 1 - width), end
+    span = re.search(
+        r"(20\d{2})?年?(\d{1,2})月(?:至|到|–|—|-)"
+        r"(?:(20\d{2})年)?(\d{1,2})月",
+        compact,
+    )
+    iso = re.search(r"(20\d{2})-(0[1-9]|1[0-2])(?:至|到|–|—)(20\d{2})-(0[1-9]|1[0-2])", compact)
+    if span:
+        year_end = span.group(3) or span.group(1) or end[:4]
+        year_start = span.group(1) or year_end
+        start = f"{year_start}-{int(span.group(2)):02d}"
+        close = f"{year_end}-{int(span.group(4)):02d}"
+        if start > close:
+            start, close = close, start
+        return start, close
+    if iso:
+        start, close = f"{iso.group(1)}-{iso.group(2)}", f"{iso.group(3)}-{iso.group(4)}"
+        if start > close:
+            start, close = close, start
+        return start, close
+    if re.search(r"近\d+个月|至\d+月|到\d+月", compact):
+        return None
+    return end, end
+
+
 def try_agent_extreme(store: Store, question: str, period: str, view: str) -> dict | None:
     """「最差/最好的 N 家」returns exactly N rows, low or high, as a table."""
     raw = question.strip()
@@ -966,7 +1004,11 @@ def try_agent_extreme(store: Store, question: str, period: str, view: str) -> di
     number = int(count.group(1))
     if not 1 <= number <= 20:
         return None
-    chosen = resolve_period(raw, period)
+    end = resolve_period(raw, period)
+    window = _extreme_window(raw, end)
+    if window is None:
+        return None
+    start, end = window
     metric = "net_sales"
     if "回款率" in raw:
         metric = "collection_rate"
@@ -974,15 +1016,16 @@ def try_agent_extreme(store: Store, question: str, period: str, view: str) -> di
         metric = "collection_amount"
     result = run_query(
         store,
-        {"metrics": [metric], "group_by": "customer", "order": "low" if low else "value", "top_n": number, "start_month": chosen, "end_month": chosen},
-        chosen,
+        {"metrics": [metric], "group_by": "customer", "order": "low" if low else "value", "top_n": number, "start_month": start, "end_month": end},
+        end,
     )
     rows = result["result"]["数据"]
     label = METRICS[metric][0]
     direction = "最低" if low else "最高"
-    result["page_title"] = f"{period_label(chosen)}{label}{direction}的{len(rows)}家"
-    reply = f"{period_label(chosen)}{label}{direction}的{len(rows)}家见下表。"
-    return _free_report(store, raw, chosen, view, reply, [result])
+    span = period_label(end) if start == end else f"{period_label(start)}至{period_label(end)}"
+    result["page_title"] = f"{span}{label}{direction}的{len(rows)}家"
+    reply = f"{span}{label}{direction}的{len(rows)}家见下表。"
+    return _free_report(store, raw, end, view, reply, [result])
 
 
 def try_agent_count(store: Store, question: str, period: str, view: str) -> dict | None:

@@ -325,6 +325,46 @@ def test_best_and_worst_use_the_count_in_the_question():
         assert [row["_客户"] for row in table["rows"]] == expected
 
 
+
+def test_half_year_lowest_uses_window_total_not_the_end_month():
+    months = ["2026-05", "2026-06", "2026-07", "2026-08", "2026-09", "2026-10"]
+    ranked = []
+    for customer in STORE.customers.values():
+        scope = Scope(customer_id=customer["customer_id"])
+        total = sum((net_sales(STORE, month, scope) for month in months), Decimal("0"))
+        ranked.append((total, customer["customer_id"], customer["customer_name"]))
+    ranked.sort()
+    expected = [name for _, _, name in ranked[:5]]
+    october = agent.run_query(
+        STORE,
+        {"metrics": ["net_sales"], "group_by": "customer", "order": "low", "end_month": "2026-10", "top_n": 5},
+        "2026-10",
+    )
+    october_names = [row["_客户"] for row in october["result"]["数据"]]
+    assert expected == ["韶州华南代理商", "榆林西北代理商", "梧州华南代理商", "海陵华东代理商", "柳江华南代理商"]
+    assert october_names == ["榆林西北代理商", "柳江华南代理商", "梧州华南代理商", "海陵华东代理商", "潍坊华北代理商"]
+    assert expected != october_names
+
+    result = agent.run_query(
+        STORE,
+        {"metrics": ["net_sales"], "group_by": "customer", "order": "low", "start_month": "2026-05", "end_month": "2026-10", "top_n": 5},
+        "2026-10",
+    )
+    assert [row["_客户"] for row in result["result"]["数据"]] == expected
+    assert result["result"]["数据"][0]["期初"] == "2026年5月"
+    assert result["result"]["数据"][0]["期末"] == "2026年10月"
+
+    for question in ("近半年销售额最差的5家代理商", "近 6 个月销售额最差的5家代理商"):
+        reply = agent.answer(STORE, question, "2026-10")
+        table = next(chart for chart in reply["charts"] if chart["type"] == "table")
+        assert reply["page"] == "sheet"
+        _assert_sheet_provenance(reply)
+        assert [row["_客户"] for row in table["rows"]] == expected
+        assert "2026年5月至2026年10月" in reply["page_title"]
+        assert "2026年5月至2026年10月" in reply["chat_reply"]
+        assert [chart["type"] for chart in reply["charts"]] == ["table"]
+
+
 def test_without_key_the_keyword_router_answers():
     reply = agent.answer(STORE, "华东主要是哪些代理商在拖累？", "2026-10")
     assert reply["question_id"] == "follow_agents"
