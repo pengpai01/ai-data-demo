@@ -5,6 +5,7 @@ metric, dimension, or relation; otherwise it is refused with a 5.1 type.
 """
 
 import json
+import re
 from decimal import Decimal
 from pathlib import Path
 
@@ -331,8 +332,12 @@ def test_preset_main_report_and_static_version_stay_put():
     assert reply["question_id"] == "p0_main"
     assert reply["resolved_view"] == "region"
     assert "华东大区" in reply["conclusion"]["text"]
-    assert "可切换产品视角" in reply["conclusion"]["text"]
+    assert "可切换产品视角" not in reply["conclusion"]["text"]
     assert "东华" not in reply["conclusion"]["text"]
+    assert reply["view_switch"] is None
     html = (Path(__file__).resolve().parents[1] / "app" / "static" / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=18" in html
-    assert "app.css?v=18" in html
+    versions = [int(number) for number in re.findall(r"app\.(?:js|css)\?v=(\d+)", html)]
+    assert versions
+    assert min(versions) >= 18
+    assert "app.js?v=19" in html
+    assert "app.css?v=19" in html

@@ -43,6 +43,7 @@ class AskBody(BaseModel):
     period: str = DEFAULT_PERIOD
     view: str = "auto"
     history: list[dict] = Field(default_factory=list)
+    focus: dict | None = None
 
 
 @app.get("/")
@@ -68,7 +69,7 @@ def meta():
 
 @app.post("/api/ask")
 def ask_post(body: AskBody):
-    return answer(STORE, body.question, body.period, body.view, body.history)
+    return answer(STORE, body.question, body.period, body.view, body.history, body.focus)
 
 
 @app.get("/api/ask")

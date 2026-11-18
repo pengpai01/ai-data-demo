@@ -159,6 +159,7 @@ button { cursor: pointer; }
 .sheet-head h2 { margin: 0; font-size: 18px; font-weight: 650; }
 .sheet-text { margin: 0 0 14px; line-height: 1.6; }
 .scope-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--muted); font-size: 13px; }
+.current-attribution { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--ink); }
 .conclusion {
   background: var(--soft);
   border: 1px solid #cfe4e6;
