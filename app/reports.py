@@ -512,7 +512,7 @@ def build_main(store, query, compare, scope):
     other_text = ""
     if other is not None:
         other_dim = "product_line" if resolved == "region" else "region"
-        other_text = f"可切换{('产品线' if resolved == 'region' else '大区')}视角（{slice_title(other_dim, other['name'])} {pp_text(other['delta'])}）。"
+        other_text = f"可切换{('产品' if resolved == 'region' else '大区')}视角（{slice_title(other_dim, other['name'])} {pp_text(other['delta'])}）。"
     parts = decompose(primary["prev_collection"], primary["prev_net"], primary["collection"], primary["net"])
     text = (
         f"{period_label(ym)}销售回款率下降最快：{title}（{pp_text(primary['delta'])}，净销售占比 {pct_text(primary['share'])}）。"
@@ -536,7 +536,7 @@ def build_main(store, query, compare, scope):
             },
             {
                 "id": "product",
-                "label": "产品线视角",
+                "label": "产品视角",
                 "slice": "—" if product_best is None else product_best["name"],
                 "pp_text": "—" if product_best is None else pp_text(product_best["delta"]),
             },

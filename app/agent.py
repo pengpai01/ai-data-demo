@@ -19,6 +19,7 @@ from app.metrics import (
     Scope,
     ar_balance,
     collection_amount,
+    collection_rate,
     discount_amount,
     dso,
     due_amount,
@@ -76,6 +77,7 @@ METRICS = {
     "overdue_rate": ("逾期率", "pct", F_OVERDUE),
     "dso": ("DSO", "days", F_DSO),
     "weighted_age_days": ("加权平均账龄", "days", F_AGE_DAYS),
+    "customer_count": ("代理商数量", "count", "有销售数据的代理商：该范围内净销售额不为 0 的家数"),
 }
 FLOW = {"net_sales": net_sales, "list_amount": list_amount, "discount_amount": discount_amount, "collection_amount": collection_amount}
 
@@ -108,6 +110,9 @@ SYSTEM = """你是星澜诊断的经营分析助手，回答代理商销售与�
 2. 其他取数问题（某个范围的逐月数据、排行、对比、合计）调用 query_metrics，可多次调用；拿到结果后用中文回答 2 到 4 句。
    - 只查用户问到的指标。用户只说「销售数据」「经营数据」时，查净销售额、出库额、回款额、销售回款率。
    - 排行时把排序依据的指标放在 metrics 第一个，并直接沿用工具返回的排名，不要自己重排或自己算差值。比谁高用 order=value。只问本月谁最高时不要填 start_month，工具只看 end_month。问「近半年 / 某段时间销售额最好、最高、最大的代理商」时必须同时填 start_month 和 end_month，工具按区间合计从高到低排，不是只看结束月。问「下滑最大 / 下降最多 / 跌得最多」用 order=drop；问「增长最大 / 上升最多」用 order=rise。排名看「变动」列（期末减期初；金额是元，不是百分比）。跨月排行和 drop/rise 的页面只展示表格。
+   - 问有多少家代理商、某大区或某等级有几家时，metrics 只填 customer_count，不要用净销售额来数人数。公司整体用 group_by=region。家数没有对应的图，页面只展示表格和这句话。
+   - 问代理商名单、列表、有哪些代理商时，调用 list_customers。客户维度只有大区、名称、等级。不要查销售额或回款，不要排名，不要图表，也不要补账期、产品线等没问到的字段。
+   - 问各大区下每一家代理商的销售、不是问谁最高或前几名时，不要用 top_n 截成前 20，也不要按回款率再排一次名。按大区列出全部代理商的净销售额、出库额、回款额、销售回款率。
    - 没说明排序依据的「排序」，按销售回款率、order=value 排。
 3. 需要本数据没有的信息（承诺回款、直营、医院或体检中心作为客户、退货、坏账、代理商库存、预测、目标或预算等），或与经营分析无关时，调用 reject 说明原因。
 
@@ -116,7 +121,7 @@ SYSTEM = """你是星澜诊断的经营分析助手，回答代理商销售与�
 - 只写工具结果里能直接读出的事实。说升降时以「环比」列为准（正为升、负为降），不要自己比较两个数的大小，也不要跨指标推论。
 - 销售回款率 = 回款额 ÷ 净销售额，是主口径；到期回款率只作辅助对照。
 - 一律称代理商，不写经销商。
-- 不要输出表格或 Markdown，左侧页面会展示计算表和图。"""
+- 不要输出表格或 Markdown。对得上现成报告时，左侧打开那份报告。对不上报告模板时，左侧只放你这句说明和一张表，不要图。"""
 
 TOOLS = [
     {
@@ -151,6 +156,7 @@ TOOLS = [
                 "按第一个指标的变动取前 top_n 家：drop 是下滑最大（变动最小），rise 是增长最大。"
                 "金额的变动是期末减期初的元；百分比在环比列，不作为 drop/rise 的排序依据。"
                 "看某一家代理商或某一个产品的逐月数据时，用 customer 或 product 参数并且不分组。"
+                "问有多少家代理商时 metrics 只用 customer_count（净销售额不为 0 的家数），不要按代理商分组，页面只出表格。"
             ),
             "parameters": {
                 "type": "object",
@@ -172,6 +178,20 @@ TOOLS = [
                     "top_n": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
                 "required": ["metrics"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_customers",
+            "description": "列出代理商名录。只返回大区、代理商名称、等级，不返回销售额、回款、排名或图表。问名单、列表、有哪些代理商时使用。可按一个大区或一个等级筛选。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "region": {"type": "string", "enum": [name for name, _ in REGION_NAMES]},
+                    "tier": {"type": "string", "enum": list(TIER_ORDER)},
+                },
             },
         },
     },
@@ -216,8 +236,26 @@ def _find_customer(store: Store, name: str) -> dict:
     raise ToolError(f"代理商名称不唯一：{name}，可选 " + "、".join(row["customer_name"] for row in loose[:8]))
 
 
+def _agents_with_sales(store: Store, months: list[str], scope: Scope) -> Decimal:
+    """Agents whose net sales are not zero in any month of the window."""
+    total = 0
+    for row in store.customers.values():
+        if scope.region_id and row["region_id"] != scope.region_id:
+            continue
+        if scope.tier and row["customer_tier"] != scope.tier:
+            continue
+        if scope.customer_id and row["customer_id"] != scope.customer_id:
+            continue
+        cust = scope.narrow(customer_id=row["customer_id"])
+        if any(net_sales(store, month, cust) != 0 for month in months):
+            total += 1
+    return Decimal(total)
+
+
 def _metric_value(store: Store, key: str, months: list[str], scope: Scope) -> Decimal | None:
     """One month, or a window total when len(months) > 1 (flow metrics only)."""
+    if key == "customer_count":
+        return _agents_with_sales(store, months, scope)
     if len(months) > 1:
         if key in FLOW:
             return sum((FLOW[key](store, m, scope) for m in months), Decimal("0"))
@@ -264,6 +302,8 @@ def _text(kind: str, value: Decimal | None) -> str:
         return money_text(value)
     if kind == "pct":
         return pct_text(value)
+    if kind == "count":
+        return f"{int(value)}家"
     return days_text(value)
 
 
@@ -272,6 +312,9 @@ def _delta_text(kind: str, prev: Decimal | None, cur: Decimal | None) -> str:
     if prev is None or cur is None:
         return "—"
     delta = cur - prev
+    if kind == "count":
+        homes = int(delta)
+        return f"+{homes}家" if homes > 0 else f"{homes}家"
     if kind == "money":
         text = money_text(delta)
         return f"+{text}" if delta > 0 else text
@@ -284,6 +327,9 @@ def _change(kind: str, prev: Decimal | None, cur: Decimal | None) -> str:
     """Amounts: relative change; rates: pp; days: day difference."""
     if prev is None or cur is None:
         return "—"
+    if kind == "count":
+        homes = int(cur - prev)
+        return f"+{homes}家" if homes > 0 else f"{homes}家"
     if kind == "days" and abs(cur - prev) < Decimal("0.05"):
         return "0.0天"
     if kind == "pct" and abs(cur - prev) < Decimal("0.00005"):
@@ -302,6 +348,8 @@ def _num(kind: str, value: Decimal | None):
         return money_num(value)
     if kind == "pct":
         return pct_num(value)
+    if kind == "count":
+        return int(value)
     return days_num(value)
 
 
@@ -392,6 +440,8 @@ def run_query(store: Store, args: dict, period: str) -> dict:
     elif group_by == "tier":
         groups = [(f"{name}级代理商", base.narrow(tier=name)) for name in TIER_ORDER if not base.tier or base.tier == name]
     elif group_by == "customer":
+        if "customer_count" in keys:
+            raise ToolError("统计代理商家数时不要按代理商分组，请用 group_by=none、region、product_line 或 tier")
         top_n = max(1, min(int(args.get("top_n") or 10), 20))
         if order == "value":
             if start == end:
@@ -461,7 +511,7 @@ def run_query(store: Store, args: dict, period: str) -> dict:
     matrix = {}
     for label, scope in groups:
         matrix[label] = {key: [_metric_value(store, key, [month], scope) for month in months] for key in keys}
-    if len(groups) > 1 and group_by != "customer":
+    if len(groups) > 1 and group_by != "customer" and "customer_count" not in keys:
         missing = Decimal("-1e30")
 
         def sort_value(item):
@@ -500,7 +550,8 @@ def run_query(store: Store, args: dict, period: str) -> dict:
     else:
         for rank, (label, scope) in enumerate(groups, start=1):
             for index, month in enumerate(months):
-                row = {"排名": str(rank)} if len(months) == 1 and len(groups) > 1 else {}
+                show_rank = len(months) == 1 and len(groups) > 1 and "customer_count" not in keys
+                row = {"排名": str(rank)} if show_rank else {}
                 row.update({"范围": label, "月份": period_label(month)})
                 if label in customer_names:
                     row["_客户"] = customer_names[label]
@@ -518,6 +569,13 @@ def run_query(store: Store, args: dict, period: str) -> dict:
                     row[f"{METRICS[key][0]}环比"] = "—"
                 rows.append(row)
 
+    count_only = keys == ["customer_count"]
+    if count_only:
+        notes.append("代理商数量是净销售额不为 0 的家数，不是销售金额。这个结果只展示表格。")
+    if count_only and group_by in {"region", "tier"} and len(groups) > 1 and len(months) == 1:
+        total = sum((matrix[label]["customer_count"][0] for label, _scope in groups), Decimal("0"))
+        rows.append({"范围": "合计", "月份": period_label(months[0]), "代理商数量": f"{int(total)}家"})
+
     return {
         "result": {"范围": title, "窗口": window, "分组": group_by, "说明": notes, "数据": rows},
         "keys": keys,
@@ -528,16 +586,37 @@ def run_query(store: Store, args: dict, period: str) -> dict:
         "title": title,
         "group_by": group_by,
         "order": order,
-        "table_only": group_by == "customer" and (order != "value" or len(months) > 1),
+        "table_only": True,
         "filters": [f"范围={title}", f"月份={window}", f"分组={group_by}"],
         "formulas": [METRICS[key][2] for key in keys],
     }
 
 
+def _query_prov(query: dict) -> dict:
+    return _prov(
+        " ".join(dict.fromkeys(query.get("formulas") or [])),
+        query.get("filters") or [],
+        ((query.get("result") or {}).get("数据") or [])[:80],
+    )
+
+
 def _charts(query: dict) -> list[dict]:
+    if query.get("roster"):
+        return [{
+            "id": "agent_roster",
+            "title": "代理商名单",
+            "type": "table",
+            "columns": [
+                {"key": "大区", "label": "大区"},
+                {"key": "代理商", "label": "代理商"},
+                {"key": "等级", "label": "等级"},
+            ],
+            "rows": query["result"]["数据"],
+            "provenance": _query_prov(query),
+        }]
     keys, months, groups, matrix = query["keys"], query["months"], query["groups"], query["matrix"]
     labels = [period_label(month) for month in months]
-    prov = _prov(" ".join(dict.fromkeys(query["formulas"])), query["filters"], query["result"]["数据"][:80])
+    prov = _query_prov(query)
     charts = []
     if query.get("table_only"):
         pass
@@ -660,6 +739,9 @@ def _free_report(store: Store, question: str, period: str, view: str, text: str,
     end = months[-1]
     compare, _ = comparable(store, end)
     single = len(months) == 1
+    count_only = last["keys"] == ["customer_count"]
+    roster = bool(last.get("roster"))
+    plain = count_only or roster
     query = Query("free", "free_query", question, end, view)
     return {
         "ok": True,
@@ -668,15 +750,17 @@ def _free_report(store: Store, question: str, period: str, view: str, text: str,
         "question_id": "free_query",
         "question": question,
         "period": end,
-        "period_label": period_label(end) if single else f"{period_label(months[0])}至{period_label(end)}",
-        "compare_period": compare if single else None,
-        "compare_label": period_label(compare) if single and compare else "",
+        "period_label": "代理商名录" if roster else (period_label(end) if single else f"{period_label(months[0])}至{period_label(end)}"),
+        "compare_period": None if plain or not single else compare,
+        "compare_label": "" if plain or not (single and compare) else period_label(compare),
         "filters": {"region_id": last["scope"].region_id, "product_line": last["scope"].product_line, "tier": last["scope"].tier, "label": last["title"]},
         "view": query.view,
         "resolved_view": query.view,
         "view_switch": None,
-        "conclusion": None,
-        "kpis": build_kpis(store, end, compare, last["scope"]) if single and compare and not last["scope"].customer_id else [],
+        "page": "sheet",
+        "page_title": last.get("page_title") or ("代理商名单" if roster else ("代理商数量" if count_only else question)),
+        "conclusion": {"text": text, "sentences": [{"text": text, "provenance": _query_prov(last)}]} if text else None,
+        "kpis": [],
         "charts": charts,
         "attribution": None,
         "chat_reply": text,
@@ -693,11 +777,213 @@ def _history(items: list[dict] | None) -> list[dict]:
     return out
 
 
+def _count_reply(result: dict) -> str:
+    rows = [row for row in result["result"]["数据"] if row.get("月份") != "区间合计"]
+    window = result["result"]["窗口"]
+    total = next((row for row in rows if row["范围"] == "合计"), None)
+    parts = [f"{row['范围']}{row['代理商数量']}" for row in rows if row["范围"] != "合计"]
+    if total:
+        return f"{window}有销售数据的代理商共{total['代理商数量']}。其中{'、'.join(parts)}。"
+    if len(rows) > 1:
+        return f"{window}有销售数据的代理商：{'、'.join(parts)}。"
+    only = rows[0]
+    scope = only["范围"]
+    if scope == "公司合计":
+        return f"{window}有销售数据的代理商共{only['代理商数量']}。"
+    return f"{window}{scope}有销售数据的代理商共{only['代理商数量']}。"
+
+
+def _roster_rows(store: Store, region_id: str | None, tier: str | None) -> list[dict]:
+    region_index = {rid: index for index, rid in enumerate(REGION_ORDER)}
+    tier_index = {name: index for index, name in enumerate(TIER_ORDER)}
+    picked = [
+        row for row in store.customers.values()
+        if (not region_id or row["region_id"] == region_id) and (not tier or row["customer_tier"] == tier)
+    ]
+    picked.sort(key=lambda row: (region_index[row["region_id"]], tier_index[row["customer_tier"]], row["customer_name"]))
+    return [
+        {"大区": f"{REGION_LABEL[row['region_id']]}大区", "代理商": row["customer_name"], "等级": f"{row['customer_tier']}级"}
+        for row in picked
+    ]
+
+
+def _roster_query(store: Store, period: str, region: str | None, tier: str | None) -> dict:
+    if region and region not in REGION_ID:
+        raise ToolError(f"未知大区：{region}")
+    if tier and tier not in TIER_ORDER:
+        raise ToolError(f"未知等级：{tier}")
+    region_id = REGION_ID.get(region) if region else None
+    if region and tier:
+        title = f"{region}大区 · {tier}级"
+    elif region:
+        title = f"{region}大区"
+    elif tier:
+        title = f"{tier}级"
+    else:
+        title = "各大区"
+    rows = _roster_rows(store, region_id, tier)
+    return {
+        "result": {
+            "范围": title,
+            "窗口": "代理商名录",
+            "分组": "customer",
+            "说明": ["只取客户维度：大区、代理商名称、等级。不含销售额、回款和排名。"],
+            "数据": rows,
+        },
+        "keys": [],
+        "months": [period],
+        "groups": [],
+        "matrix": {},
+        "scope": Scope(region_id=region_id, tier=tier or None),
+        "title": title,
+        "group_by": "customer",
+        "order": "value",
+        "table_only": True,
+        "roster": True,
+        "filters": [f"范围={title}", "来源=客户维度"],
+        "formulas": ["客户维度：大区、代理商、等级"],
+    }
+
+
+def _roster_reply(result: dict) -> str:
+    rows = result["result"]["数据"]
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["大区"]] = counts.get(row["大区"], 0) + 1
+    if result["title"] == "各大区":
+        parts = "、".join(f"{name}{count}家" for name, count in counts.items())
+        return f"各大区代理商共{len(rows)}家。{parts}。"
+    return f"{result['title']}代理商共{len(rows)}家。"
+
+
+def try_agent_list(store: Store, question: str, period: str, view: str) -> dict | None:
+    """A roster reads the customer dimension only: region, name, tier."""
+    raw = question.strip()
+    if not re.search(r"列表|名单|有哪些代理|哪些公司|有哪些公司|代理商有哪些|有哪几家", raw):
+        return None
+    if re.search(r"销售|回款|出库|折扣|下滑|下降|增长|上升|最高|最低|最好|最差|排名|排行|拖累|欠款|逾期|账龄|DSO|dso|对比|环比|多少|贡献|原因", raw, re.I):
+        return None
+    chosen = resolve_period(raw, period)
+    regions = [name for name, _rid in REGION_NAMES if name in raw]
+    tiers = re.findall(r"([ABC])级", raw)
+    if len(regions) > 1 or len(tiers) > 1:
+        return None
+    result = _roster_query(store, chosen, regions[0] if regions else None, tiers[0] if tiers else None)
+    return _free_report(store, raw, chosen, view, _roster_reply(result), [result])
+
+
+def try_region_agent_sales(store: Store, question: str, period: str, view: str) -> dict | None:
+    """Every agent's sales under each region. Not a national top-N ranking."""
+    raw = question.strip()
+    if not re.search(r"各代理商|每个代理商|各个代理商|每家代理商|所有代理商|全部代理商", raw):
+        return None
+    if not re.search(r"销售|卖了|经营数据|销售情况|销售数据", raw):
+        return None
+    if re.search(r"最高|最低|最好|最差|排名|排行|下滑|下降|增长|上升|TOP|top|前\s*\d+", raw, re.I):
+        return None
+    chosen = resolve_period(raw, period)
+    regions = [name for name, _rid in REGION_NAMES if name in raw]
+    if len(regions) > 1:
+        return None
+    region_id = REGION_ID[regions[0]] if len(regions) == 1 else None
+    region_index = {rid: index for index, rid in enumerate(REGION_ORDER)}
+    picked = []
+    for row in store.customers.values():
+        if region_id and row["region_id"] != region_id:
+            continue
+        scope = Scope(customer_id=row["customer_id"])
+        net = net_sales(store, chosen, scope)
+        if net == 0:
+            continue
+        picked.append((row, net, list_amount(store, chosen, scope), collection_amount(store, chosen, scope), collection_rate(store, chosen, scope)))
+    picked.sort(key=lambda item: (region_index[item[0]["region_id"]], -item[1], item[0]["customer_name"]))
+    rows = [
+        {
+            "大区": f"{REGION_LABEL[row['region_id']]}大区",
+            "代理商": row["customer_name"],
+            "净销售额": money_text(net),
+            "出库额": money_text(gross),
+            "回款额": money_text(collected),
+            "销售回款率": pct_text(rate),
+        }
+        for row, net, gross, collected, rate in picked
+    ]
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["大区"]] = counts.get(row["大区"], 0) + 1
+    parts = "、".join(f"{name}{count}家" for name, count in counts.items())
+    scope_name = f"{regions[0]}大区" if regions else "五大区"
+    reply = f"{period_label(chosen)}{scope_name}{len(rows)}家代理商都有销售。{parts}。下表按大区列出每一家的净销售额、出库额、回款额和销售回款率。"
+    title = f"{regions[0]}大区" if regions else "各大区"
+    result = {
+        "result": {
+            "范围": title,
+            "窗口": period_label(chosen),
+            "分组": "customer",
+            "说明": ["按大区列出该月全部有销售的代理商，不是全国前 N 名。"],
+            "数据": rows,
+        },
+        "keys": ["net_sales", "list_amount", "collection_amount", "collection_rate"],
+        "months": [chosen],
+        "groups": [],
+        "matrix": {},
+        "scope": Scope(region_id=region_id),
+        "title": title,
+        "group_by": "none",
+        "order": "value",
+        "table_only": True,
+        "page_title": f"{period_label(chosen)}各代理商销售",
+        "filters": [f"范围={title}", f"月份={period_label(chosen)}"],
+        "formulas": [F_NET, F_SHIP, F_COL, F_RATE],
+    }
+    return _free_report(store, raw, chosen, view, reply, [result])
+
+
+def try_agent_count(store: Store, question: str, period: str, view: str) -> dict | None:
+    """Headcount questions have no chart. The page is the count table and one sentence."""
+    raw = question.strip()
+    if not re.search(r"多少家|有几家|几家代理|多少个代理|代理商数量|有多少代理|多少代理商", raw):
+        return None
+    if re.search(r"销售|回款|出库|折扣|下滑|下降|增长|上升|最高|最低|最好|最差|排名|排行|拖累|欠款|逾期|账龄|DSO|dso|对比|环比", raw, re.I):
+        return None
+    chosen = resolve_period(raw, period)
+    regions = [name for name, _rid in REGION_NAMES if name in raw]
+    tiers = re.findall(r"([ABC])级", raw)
+    lines = [line for line in LINE_ORDER if line in raw]
+    by_region = bool(re.search(r"各大区|每个大区|各区|分大区|按大区", raw))
+    by_tier = bool(re.search(r"各等级|每个等级|按等级|各级", raw)) or len(tiers) > 1
+    by_line = bool(re.search(r"各产品线|每个产品线|按产品线|每条产品线", raw)) or len(lines) > 1
+    args: dict = {"metrics": ["customer_count"], "start_month": chosen, "end_month": chosen}
+    if len(regions) == 1:
+        args["region"] = regions[0]
+    if len(tiers) == 1 and not by_tier:
+        args["tier"] = tiers[0]
+    if len(lines) == 1 and not by_line:
+        args["product_line"] = lines[0]
+    if by_tier:
+        args["group_by"] = "tier"
+    elif by_line:
+        args["group_by"] = "product_line"
+    elif by_region or (not regions and not lines):
+        args["group_by"] = "region"
+    result = run_query(store, args, chosen)
+    return _free_report(store, raw, chosen, view, _count_reply(result), [result])
+
+
 def answer(store: Store, question: str, period: str, view: str = "auto", history: list[dict] | None = None) -> dict:
     text = question.strip()
     drilled = try_customer_sku(store, text, period, view)
     if drilled is not None:
         return drilled
+    listed = try_agent_list(store, text, period, view)
+    if listed is not None:
+        return listed
+    by_region = try_region_agent_sales(store, text, period, view)
+    if by_region is not None:
+        return by_region
+    counted = try_agent_count(store, text, period, view)
+    if counted is not None:
+        return counted
     if text in PRESET_TEXTS or not os.environ.get("DEEPSEEK_API_KEY", "").strip():
         return keyword_answer(store, text, period, view)
     chosen = resolve_period(text, period)
@@ -733,6 +1019,13 @@ def answer(store: Store, question: str, period: str, view: str = "auto", history
                 if name == "open_report":
                     try:
                         return _open_report(store, text, args, chosen, view)
+                    except ToolError as error:
+                        content = json.dumps({"error": str(error)}, ensure_ascii=False)
+                elif name == "list_customers":
+                    try:
+                        result = _roster_query(store, chosen, args.get("region") or None, args.get("tier") or None)
+                        queries.append(result)
+                        content = json.dumps(result["result"], ensure_ascii=False)
                     except ToolError as error:
                         content = json.dumps({"error": str(error)}, ensure_ascii=False)
                 elif name == "query_metrics":

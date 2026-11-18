@@ -515,6 +515,39 @@ function renderReport(data) {
   if (data.attribution) root.appendChild(renderAttribution(data.attribution));
 }
 
+function renderSheet(data) {
+  const root = $("#report");
+  root.innerHTML = "";
+  root.scrollTop = 0;
+  const head = document.createElement("div");
+  head.className = "sheet-head";
+  const title = document.createElement("h2");
+  title.textContent = data.page_title || "名单";
+  const back = document.createElement("button");
+  back.type = "button";
+  back.className = "linkish";
+  back.textContent = "返回主问";
+  back.addEventListener("click", () => ask(state.main, { view: "auto" }));
+  head.append(title, back);
+  root.appendChild(head);
+  const sentences = data.conclusion?.sentences || [];
+  if (sentences.length) {
+    const paragraph = document.createElement("p");
+    paragraph.className = "sheet-text";
+    sentences.forEach((sentence) => {
+      if (!sentence.text) return;
+      const span = document.createElement("span");
+      span.textContent = sentence.text;
+      paragraph.appendChild(span);
+      if (sentence.provenance) paragraph.appendChild(sourceButton(sentence.provenance));
+    });
+    root.appendChild(paragraph);
+  }
+  (data.charts || []).filter((chart) => chart.type === "table").forEach((chart) => {
+    root.appendChild(renderChart(chart));
+  });
+}
+
 function renderAttribution(block) {
   const section = document.createElement("section");
   section.className = "block";
@@ -653,8 +686,8 @@ async function ask(question, opts = {}) {
     state.history.push({ role: "user", text }, { role: "assistant", text: reply });
   }
   else if (opts.note) push("assistant", `已按${labelMonth(state.period)}重算当前问题。`);
-  if (!data.keep_report && data.supported !== false) renderReport(data);
-  else if (!data.keep_report && data.conclusion) renderReport(data);
+  const show = !data.keep_report && (data.supported !== false || data.conclusion);
+  if (show) (data.page === "sheet" ? renderSheet : renderReport)(data);
 }
 
 function renderChips(questions) {
