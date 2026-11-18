@@ -100,6 +100,39 @@ def test_customer_drop_is_a_table_of_the_largest_net_sales_decline():
     assert [chart["type"] for chart in agent._charts(level)] == ["table"]
 
 
+
+def test_october_lowest_net_sales_are_the_five_smallest_agents():
+    result = agent.run_query(
+        STORE,
+        {"metrics": ["net_sales"], "group_by": "customer", "order": "low", "end_month": "2026-10", "top_n": 5},
+        "2026-10",
+    )
+    rows = result["result"]["数据"]
+    assert [row["排名"] for row in rows] == ["1", "2", "3", "4", "5"]
+    assert [key for key in rows[0] if not str(key).startswith("_")] == ["排名", "范围", "月份", "净销售额"]
+    assert all(row["月份"] == "2026年10月" for row in rows)
+
+    def yuan(text):
+        return Decimal(text.replace(",", "").removesuffix("元"))
+
+    ranked = []
+    for customer in STORE.customers.values():
+        value = net_sales(STORE, "2026-10", Scope(customer_id=customer["customer_id"]))
+        if value is None:
+            continue
+        ranked.append((value, customer["customer_id"], customer["customer_name"]))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    expected = ranked[:5]
+    assert [row["_客户"] for row in rows] == [name for _, _, name in expected]
+    assert [yuan(row["净销售额"]) for row in rows] == [value for value, _, _ in expected]
+    assert [chart["type"] for chart in agent._charts(result)] == ["table"]
+
+    high = agent.run_query(STORE, {"metrics": ["net_sales"], "group_by": "customer", "order": "value", "top_n": 5}, "2026-10")
+    high_values = [yuan(row["净销售额"]) for row in high["result"]["数据"]]
+    assert high_values == sorted(high_values, reverse=True)
+    assert high_values[0] > yuan(rows[-1]["净销售额"])
+
+
 def test_half_year_agent_ranking_uses_the_window_total_and_only_a_table():
     result = agent.run_query(
         STORE,
@@ -260,6 +293,36 @@ def test_each_agent_sales_by_region_is_the_full_october_table():
     shantou = next(row for row in table["rows"] if row["代理商"] == "潮汕华南代理商")
     assert shantou["销售回款率"] == "131.98%"
     assert agent.try_region_agent_sales(STORE, "净销售额最高的代理商", "2026-10", "auto") is None
+
+
+
+def test_best_and_worst_use_the_count_in_the_question():
+    ranked = []
+    for customer in STORE.customers.values():
+        scope = Scope(customer_id=customer["customer_id"])
+        ranked.append((net_sales(STORE, "2026-10", scope), customer["customer_id"], customer["customer_name"]))
+    low_to_high = [name for _, _, name in sorted(ranked)]
+    high_to_low = [name for _, _, name in sorted(ranked, key=lambda item: (-item[0], item[1]))]
+    cases = [
+        ("10销售额最差的5家代理商", "low", 5, low_to_high[:5]),
+        ("销售额最差的10家代理商", "low", 10, low_to_high[:10]),
+        ("销售额最好的8家代理商", "value", 8, high_to_low[:8]),
+    ]
+    for question, order, count, expected in cases:
+        result = agent.run_query(
+            STORE,
+            {"metrics": ["net_sales"], "group_by": "customer", "order": order, "top_n": count, "end_month": "2026-10"},
+            "2026-10",
+        )
+        assert [row["_客户"] for row in result["result"]["数据"]] == expected
+        reply = agent.answer(STORE, question, "2026-10")
+        table = next(chart for chart in reply["charts"] if chart["type"] == "table")
+        assert len(table["rows"]) == count
+        assert [chart["type"] for chart in reply["charts"]] == ["table"]
+        assert reply["page"] == "sheet"
+        _assert_sheet_provenance(reply)
+        assert "前20" not in reply["chat_reply"] and "20家" not in reply["chat_reply"]
+        assert [row["_客户"] for row in table["rows"]] == expected
 
 
 def test_without_key_the_keyword_router_answers():

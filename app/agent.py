@@ -109,7 +109,7 @@ SYSTEM = """你是星澜诊断的经营分析助手，回答代理商销售与�
 {guide}
 2. 其他取数问题（某个范围的逐月数据、排行、对比、合计）调用 query_metrics，可多次调用；拿到结果后用中文回答 2 到 4 句。
    - 只查用户问到的指标。用户只说「销售数据」「经营数据」时，查净销售额、出库额、回款额、销售回款率。
-   - 排行时把排序依据的指标放在 metrics 第一个，并直接沿用工具返回的排名，不要自己重排或自己算差值。比谁高用 order=value。只问本月谁最高时不要填 start_month，工具只看 end_month。问「近半年 / 某段时间销售额最好、最高、最大的代理商」时必须同时填 start_month 和 end_month，工具按区间合计从高到低排，不是只看结束月。问「下滑最大 / 下降最多 / 跌得最多」用 order=drop；问「增长最大 / 上升最多」用 order=rise。排名看「变动」列（期末减期初；金额是元，不是百分比）。跨月排行和 drop/rise 的页面只展示表格。
+   - 排行时把排序依据的指标放在 metrics 第一个，并直接沿用工具返回的排名，不要自己重排或自己算差值。比谁高用 order=value。只问本月谁最高时不要填 start_month，工具只看 end_month。问「最差 / 最低 / 最少 / 最小」（例如销售额最差、净销售额最低）用 order=low：只看 end_month，按该月数值从小到大取前 top_n 家。这就是最低的几家，直接引用排名和金额，不要说工具只返回从高到低的前 20 名、数据无法支持最低。order=low 是金额最小，不是跌幅，不要改用 order=drop。问了几家，top_n 就填几家。问「近半年 / 某段时间销售额最好、最高、最大的代理商」时必须同时填 start_month 和 end_month，工具按区间合计从高到低排，不是只看结束月。问「下滑最大 / 下降最多 / 跌得最多」用 order=drop；问「增长最大 / 上升最多」用 order=rise。drop 和 rise 的排名看「变动」列（期末减期初；金额是元，不是百分比）。对不上现成报告时只出表格。
    - 问有多少家代理商、某大区或某等级有几家时，metrics 只填 customer_count，不要用净销售额来数人数。公司整体用 group_by=region。家数没有对应的图，页面只展示表格和这句话。
    - 问代理商名单、列表、有哪些代理商时，调用 list_customers。客户维度只有大区、名称、等级。不要查销售额或回款，不要排名，不要图表，也不要补账期、产品线等没问到的字段。
    - 问各大区下每一家代理商的销售、不是问谁最高或前几名时，不要用 top_n 截成前 20，也不要按回款率再排一次名。按大区列出全部代理商的净销售额、出库额、回款额、销售回款率。
@@ -151,7 +151,10 @@ TOOLS = [
                 "（金额类求和，回款率/折扣率按合计重算；余额、DSO、账龄类没有合计）。"
                 "按产品分组看一条产品线下的各个产品，建议同时给 product_line。"
                 "按代理商分组：order=value 且只给一个月时，只看 end_month，按第一个指标从高到低取前 top_n 家。"
+                "order=low 且只给一个月时，同样只看 end_month，按第一个指标从低到高（最小在前）取前 top_n 家。"
+                "问最差、最低、最少、最小（销售额最差、净销售额最低）时必须用 order=low，按数值从小到大。问最好、最高、最大时用 order=value，从大到小。家数不固定：最差的 5 家、最差的 10 家、最好的 8 家，top_n 都等于问句里的家数，只返回这么多家。直接引用这几家，不要改用 order=drop，也不要说只返回了前 20 名、无法支持。"
                 "order=value 且 start_month 早于 end_month 时，按这段时间的区间合计从高到低取前 top_n 家（金额各月相加，比率按合计重算），不是只看结束月。"
+                "order=low 且 start_month 早于 end_month 时，按这段时间的区间合计从低到高取前 top_n 家。"
                 "order=drop 或 rise 比较 start_month 与 end_month（省略或与 end 相同则与上月比），"
                 "按第一个指标的变动取前 top_n 家：drop 是下滑最大（变动最小），rise 是增长最大。"
                 "金额的变动是期末减期初的元；百分比在环比列，不作为 drop/rise 的排序依据。"
@@ -172,8 +175,8 @@ TOOLS = [
                     "group_by": {"type": "string", "enum": ["none", "region", "product_line", "product", "tier", "customer"]},
                     "order": {
                         "type": "string",
-                        "enum": ["value", "drop", "rise"],
-                        "description": "value：单月按该月数值从高到低，跨月按区间合计从高到低。drop 按变动从小到大（下滑最大在前）；rise 按变动从大到小。drop 和 rise 仅用于 group_by=customer。",
+                        "enum": ["value", "low", "drop", "rise"],
+                        "description": "value：单月按该月数值从高到低，跨月按区间合计从高到低。low：单月按该月数值从低到高（最小在前），跨月按区间合计从低到高；用于最差、最低、最少、最小，不是跌幅。drop 按变动从小到大（下滑最大在前）；rise 按变动从大到小。low、drop 和 rise 仅用于 group_by=customer。top_n 等于用户要的家数。",
                     },
                     "top_n": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
@@ -420,10 +423,10 @@ def run_query(store: Store, args: dict, period: str) -> dict:
     if customer and group_by == "customer":
         group_by = "none"
     order = args.get("order") or "value"
-    if order not in {"value", "drop", "rise"}:
-        raise ToolError("order 只能是 value、drop 或 rise")
+    if order not in {"value", "low", "drop", "rise"}:
+        raise ToolError("order 只能是 value、low、drop 或 rise")
     if order != "value" and group_by != "customer":
-        raise ToolError("order=drop 或 rise 只用于按代理商分组")
+        raise ToolError("order=low、drop 或 rise 只用于按代理商分组")
     notes = []
     if group_by == "region":
         groups = [(f"{REGION_LABEL[rid]}大区", base.narrow(region_id=rid)) for rid in REGION_ORDER if not base.region_id or base.region_id == rid]
@@ -443,7 +446,7 @@ def run_query(store: Store, args: dict, period: str) -> dict:
         if "customer_count" in keys:
             raise ToolError("统计代理商家数时不要按代理商分组，请用 group_by=none、region、product_line 或 tier")
         top_n = max(1, min(int(args.get("top_n") or 10), 20))
-        if order == "value":
+        if order in {"value", "low"}:
             if start == end:
                 months = [end]
         else:
@@ -460,7 +463,7 @@ def run_query(store: Store, args: dict, period: str) -> dict:
             if base.customer_id and row["customer_id"] != base.customer_id:
                 continue
             scope = base.narrow(customer_id=row["customer_id"])
-            if order == "value":
+            if order in {"value", "low"}:
                 value = _metric_value(store, keys[0], months, scope)
                 if value is None:
                     continue
@@ -471,8 +474,8 @@ def run_query(store: Store, args: dict, period: str) -> dict:
                 if opened is None or closed is None or (opened == 0 and closed == 0):
                     continue
                 candidates.append((closed - opened, row["customer_id"], row, scope))
-        if order == "value":
-            candidates.sort(key=lambda item: (-item[0], item[1]))
+        if order == "low":
+            candidates.sort(key=lambda item: (item[0], item[1]))
         elif order == "drop":
             candidates.sort(key=lambda item: (item[0], item[1]))
         else:
@@ -481,7 +484,17 @@ def run_query(store: Store, args: dict, period: str) -> dict:
         customer_names = {label: row["customer_name"] for (_, _, row, _), (label, _) in zip(candidates[:top_n], groups)}
         metric_name = METRICS[keys[0]][0]
         if order == "value" and len(months) == 1:
-            notes.append(f"按代理商分组只看 {period_label(end)}，按{metric_name}从高到低取前 {len(groups)} 家（共 {len(candidates)} 家有数）。")
+            notes.append(f"按代理商分组只看 {period_label(end)}，按{metric_name}从高到低取前 {len(groups)} 家（共 {len(candidates)} 家有数）。表里只有这 {len(groups)} 家。")
+        elif order == "low" and len(months) == 1:
+            notes.append(
+                f"按代理商分组只看 {period_label(end)}，按{metric_name}从低到高取前 {len(groups)} 家"
+                f"（最小在前，共 {len(candidates)} 家有数）。这是该月数值最小的代理商，可以直接引用。"
+            )
+        elif order == "low":
+            notes.append(
+                f"按代理商分组看 {period_label(months[0])}至{period_label(months[-1])}的区间合计，"
+                f"按{metric_name}从低到高取前 {len(groups)} 家（共 {len(candidates)} 家有数）。表里只有这 {len(groups)} 家。"
+            )
         elif order == "value":
             notes.append(
                 f"按代理商分组看 {period_label(months[0])}至{period_label(months[-1])}的区间合计，"
@@ -502,7 +515,7 @@ def run_query(store: Store, args: dict, period: str) -> dict:
     if len(groups) * len(months) * len(keys) > MAX_CELLS:
         raise ToolError("结果太大，请缩小月份或分组")
 
-    if group_by == "customer" and order != "value":
+    if group_by == "customer" and order in {"drop", "rise"}:
         window = f"{period_label(months[0])}与{period_label(months[-1])}相比"
     elif len(months) > 1:
         window = f"{period_label(months[0])}至{period_label(months[-1])}，共 {len(months)} 个月"
@@ -523,7 +536,7 @@ def run_query(store: Store, args: dict, period: str) -> dict:
         span = "区间合计" if len(months) > 1 else period_label(months[0])
         notes.append(f"已按{span}的{METRICS[keys[0]][0]}从高到低排序。点击表头可改按其他列排序。")
     rows = []
-    if group_by == "customer" and order != "value":
+    if group_by == "customer" and order in {"drop", "rise"}:
         for rank, (label, _scope) in enumerate(groups, start=1):
             row = {"排名": str(rank), "范围": label, "期初": period_label(months[0]), "期末": period_label(months[-1])}
             if label in customer_names:
@@ -939,6 +952,39 @@ def try_region_agent_sales(store: Store, question: str, period: str, view: str) 
     return _free_report(store, raw, chosen, view, reply, [result])
 
 
+
+def try_agent_extreme(store: Store, question: str, period: str, view: str) -> dict | None:
+    """「最差/最好的 N 家」returns exactly N rows, low or high, as a table."""
+    raw = question.strip()
+    count = re.search(r"(\d+)\s*家", raw)
+    if count is None or "代理商" not in raw:
+        return None
+    low = bool(re.search(r"最差|最低|最少|最小", raw))
+    high = bool(re.search(r"最好|最高|最大", raw))
+    if low == high or re.search(r"下滑|下降|跌|增长|上升|拖累", raw):
+        return None
+    number = int(count.group(1))
+    if not 1 <= number <= 20:
+        return None
+    chosen = resolve_period(raw, period)
+    metric = "net_sales"
+    if "回款率" in raw:
+        metric = "collection_rate"
+    elif "回款" in raw and "销售" not in raw:
+        metric = "collection_amount"
+    result = run_query(
+        store,
+        {"metrics": [metric], "group_by": "customer", "order": "low" if low else "value", "top_n": number, "start_month": chosen, "end_month": chosen},
+        chosen,
+    )
+    rows = result["result"]["数据"]
+    label = METRICS[metric][0]
+    direction = "最低" if low else "最高"
+    result["page_title"] = f"{period_label(chosen)}{label}{direction}的{len(rows)}家"
+    reply = f"{period_label(chosen)}{label}{direction}的{len(rows)}家见下表。"
+    return _free_report(store, raw, chosen, view, reply, [result])
+
+
 def try_agent_count(store: Store, question: str, period: str, view: str) -> dict | None:
     """Headcount questions have no chart. The page is the count table and one sentence."""
     raw = question.strip()
@@ -981,6 +1027,9 @@ def answer(store: Store, question: str, period: str, view: str = "auto", history
     by_region = try_region_agent_sales(store, text, period, view)
     if by_region is not None:
         return by_region
+    extreme = try_agent_extreme(store, text, period, view)
+    if extreme is not None:
+        return extreme
     counted = try_agent_count(store, text, period, view)
     if counted is not None:
         return counted
