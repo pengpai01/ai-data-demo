@@ -1,6 +1,6 @@
 const COLORS = ["#8aa4ab", "#0f6f78", "#c9842a", "#5c6b73"];
 const LINE_COLORS = ["#0f6f78", "#c9842a", "#3d5a80", "#8d4e2a", "#2f7d4a"];
-const state = { question: "", view: "auto", period: "2026-10", main: "", history: [] };
+const state = { question: "", view: "auto", period: "2026-10", main: "", history: [], focus: null };
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -159,6 +159,7 @@ function groupedBar(chart) {
     if ((chart.highlight || []).includes(name)) {
       shapes += `<rect x="${plot.l + band * index + 2}" y="${plot.t}" width="${band - 4}" height="${innerH}" fill="rgba(180,35,24,0.08)" />`;
     }
+    const memberKey = (chart.members && chart.members[index] && chart.members[index].key) || name;
     series.forEach((item, seriesIndex) => {
       const value = item.values[index];
       if (value == null) return;
@@ -166,7 +167,7 @@ function groupedBar(chart) {
       const y = yOf(Math.max(value, 0));
       const h = Math.abs(yOf(value) - zero);
       const muted = (chart.muted || []).includes(name);
-      shapes += `<rect x="${x}" y="${Math.min(y, zero)}" width="${Math.max(barW - 2, 1)}" height="${Math.max(h, 0)}" fill="${COLORS[seriesIndex % COLORS.length]}" opacity="${muted ? 0.35 : 1}" data-drill="${esc(name)}" />`;
+      shapes += `<rect x="${x}" y="${Math.min(y, zero)}" width="${Math.max(barW - 2, 1)}" height="${Math.max(h, 0)}" fill="${COLORS[seriesIndex % COLORS.length]}" opacity="${muted ? 0.35 : 1}" data-drill="${esc(name)}" data-key="${esc(memberKey)}" />`;
     });
   });
   shapes += labels.marks;
@@ -294,6 +295,14 @@ function renderChart(chart) {
       if (!chart.drill) return;
       node.addEventListener("click", () => {
         const name = node.getAttribute("data-drill");
+        if (chart.drill === "attribution") {
+          const key = node.getAttribute("data-key") || name;
+          const dimension = chart.drill_dimension;
+          const current = state.focus;
+          const same = current && current.dimension === dimension && String(current.key) === String(key);
+          ask(state.main, { view: "auto", focus: same ? null : { dimension, key }, quiet: true });
+          return;
+        }
         if (chart.drill === "trend") ask(`近6个月${name}销售回款率怎么走？`);
         else ask(`只看${name}`);
       });
@@ -437,22 +446,50 @@ function tableEl(columns, rows) {
   return table;
 }
 
+function resetAttribution() {
+  ask(state.main, { view: "auto", focus: null, quiet: true });
+}
+
 function renderReport(data) {
   const root = $("#report");
   root.innerHTML = "";
   root.scrollTop = 0;
+  state.focus = data.question_id === "p0_main" && data.attribution_target
+    ? { dimension: data.attribution_target.dimension, key: data.attribution_target.key }
+    : null;
   const scope = document.createElement("div");
   scope.className = "scope-row";
-  const label = document.createElement("span");
-  label.textContent = `范围：${data.filters?.label || "公司合计"} · ${data.period_label || ""}${data.compare_label ? ` vs ${data.compare_label}` : ""}`;
-  scope.appendChild(label);
-  if (data.question_id !== "p0_main") {
+  const target = data.question_id === "p0_main" ? data.attribution_target : null;
+  if (target) {
+    const label = document.createElement("span");
+    label.className = "current-attribution";
+    label.append(`当前归因：${target.label}`);
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "linkish";
+    clear.textContent = "×";
+    clear.setAttribute("aria-label", "返回默认");
+    clear.addEventListener("click", resetAttribution);
+    label.appendChild(clear);
+    label.append(` · ${data.period_label || ""}${data.compare_label ? ` vs ${data.compare_label}` : ""}`);
     const back = document.createElement("button");
     back.type = "button";
     back.className = "linkish";
-    back.textContent = "返回主问";
-    back.addEventListener("click", () => ask(state.main, { view: "auto" }));
-    scope.appendChild(back);
+    back.textContent = "返回默认";
+    back.addEventListener("click", resetAttribution);
+    scope.append(label, back);
+  } else {
+    const label = document.createElement("span");
+    label.textContent = `范围：${data.filters?.label || "公司合计"} · ${data.period_label || ""}${data.compare_label ? ` vs ${data.compare_label}` : ""}`;
+    scope.appendChild(label);
+    if (data.question_id !== "p0_main") {
+      const back = document.createElement("button");
+      back.type = "button";
+      back.className = "linkish";
+      back.textContent = "返回主问";
+      back.addEventListener("click", () => ask(state.main, { view: "auto" }));
+      scope.appendChild(back);
+    }
   }
   root.appendChild(scope);
 
@@ -467,20 +504,7 @@ function renderReport(data) {
     copy.appendChild(p);
   });
   if (sentences.length) conclusion.appendChild(copy);
-  if (data.view_switch) {
-    const sw = document.createElement("div");
-    sw.className = "switch";
-    data.view_switch.options.forEach((option) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = option.label;
-      button.setAttribute("aria-pressed", String(option.id === data.view_switch.current));
-      button.addEventListener("click", () => ask(state.question || state.main, { view: option.id, quiet: true }));
-      sw.appendChild(button);
-    });
-    conclusion.appendChild(sw);
-  }
-  if (sentences.length || data.view_switch) root.appendChild(conclusion);
+  if (sentences.length) root.appendChild(conclusion);
 
   const kpis = document.createElement("div");
   kpis.className = "kpis";
@@ -516,6 +540,7 @@ function renderReport(data) {
 }
 
 function renderSheet(data) {
+  state.focus = null;
   const root = $("#report");
   root.innerHTML = "";
   root.scrollTop = 0;
@@ -666,12 +691,14 @@ async function ask(question, opts = {}) {
   const history = state.history.slice(-6);
   if (!opts.quiet) push("user", text);
   const pending = opts.quiet ? null : push("assistant pending", "正在分析…");
+  const payload = { question: text, period: state.period, view, history };
+  if (Object.prototype.hasOwnProperty.call(opts, "focus")) payload.focus = opts.focus;
   let data;
   try {
     const response = await fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: text, period: state.period, view, history }),
+      body: JSON.stringify(payload),
     });
     data = await response.json();
   } catch (error) {
@@ -717,7 +744,7 @@ async function boot() {
   });
   select.addEventListener("change", () => {
     state.period = select.value;
-    if (state.question) ask(state.question, { view: state.view, quiet: true, note: true });
+    if (state.question) ask(state.question, { view: state.view, focus: state.focus, quiet: true, note: true });
   });
   renderChips(meta.questions);
   $("#ask-form").addEventListener("submit", (event) => {

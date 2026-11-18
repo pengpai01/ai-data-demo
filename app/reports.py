@@ -26,6 +26,7 @@ from app.metrics import (
     ar_bridge,
     avg_collection_days,
     collection_amount,
+    choose_default_view,
     collection_rate,
     contributions,
     customer_contribs,
@@ -224,23 +225,78 @@ def _rate_rows(slices: list[dict]) -> list[dict]:
     return rows
 
 
-def rate_chart(slices, title, chart_id, ym, compare, store, scope, drill) -> dict:
-    best = select_fastest(slices)
-    return {
+def rate_chart(slices, title, chart_id, ym, compare, store, scope, drill, highlight=None, drill_dimension=None) -> dict:
+    if highlight is None:
+        best = select_fastest(slices)
+        highlight = [] if best is None else [best["name"]]
+    chart = {
         "id": chart_id,
         "title": title,
         "type": "grouped_bar",
         "y_format": "pct",
         "drill": drill,
-        "highlight": [] if best is None else [best["name"]],
+        "highlight": highlight,
         "muted": [row["name"] for row in slices if not row["eligible"]],
         "categories": [row["name"] for row in slices],
+        "members": [{"name": row["name"], "key": row["key"]} for row in slices],
         "series": [
             {"name": period_label(compare), "values": [pct_num(row["prev_rate"]) for row in slices]},
             {"name": period_label(ym), "values": [pct_num(row["rate"]) for row in slices]},
         ],
         "footnote": "灰色切片净销售占比低于 5%，不参与下降最快评选。" if any(not row["eligible"] for row in slices) else "",
         "provenance": _prov(F_RATE + F_GATE, _filters(store, ym, compare, scope), _rate_rows(slices), [F_GATE]),
+    }
+    if drill_dimension:
+        chart["drill_dimension"] = drill_dimension
+    return chart
+
+
+def click_hint(other_dimension: str, other: dict | None) -> str:
+    """Tell the reader they can click the other overview chart. No view switch."""
+    if not other or other.get("delta") is None:
+        return ""
+    side = "右侧产品线柱" if other_dimension == "product_line" else "左侧大区柱"
+    verb = "下降" if other["delta"] < 0 else "变化"
+    return f"同期{slice_title(other_dimension, other['name'])}{verb} {pp_text(other['delta'])}，可点击{side}查看其归因。"
+
+
+def _focus_row(rows: list[dict], focus: dict) -> dict | None:
+    token = focus.get("key")
+    if token in (None, ""):
+        token = focus.get("name")
+    if token in (None, ""):
+        return None
+    token = str(token)
+    for row in rows:
+        if row.get("key") == token or row.get("name") == token:
+            return row
+    return None
+
+
+def resolve_chart_focus(region_rows: list[dict], product_rows: list[dict], focus=None) -> dict | None:
+    """Lock one attribution parent. Default is the faster eligible slice; a click may be under 5%."""
+    resolved, primary, other = choose_default_view(region_rows, product_rows)
+    if primary is None:
+        return None
+    dimension = "region" if resolved == "region" else "product_line"
+    chosen_dimension = dimension
+    chosen = primary
+    pools = {"region": region_rows, "product_line": product_rows}
+    if isinstance(focus, dict) and focus.get("dimension") in pools:
+        row = _focus_row(pools[focus["dimension"]], focus)
+        if row is not None and row.get("delta") is not None:
+            chosen_dimension = focus["dimension"]
+            chosen = row
+    return {
+        "resolved": "region" if chosen_dimension == "region" else "product",
+        "dimension": chosen_dimension,
+        "row": chosen,
+        "default_dimension": dimension,
+        "default_row": primary,
+        "other": other,
+        "other_dimension": "product_line" if dimension == "region" else "region",
+        "is_default": chosen_dimension == dimension and chosen.get("key") == primary.get("key"),
+        "cross_dimension": "product_line" if chosen_dimension == "region" else "region",
     }
 
 
@@ -398,7 +454,7 @@ def build_attribution(store: Store, ym: str, compare: str, scope: Scope, cross_d
     for row in aging_rows:
         prov_rows.append({"部分": "账龄", "项目": row["bucket"], "数值": f"{row['prev']} → {row['curr']}"})
     return {
-        "title": f"归因 · {title}",
+        "title": f"归因-{title}",
         "decomposition": {
             "collection_text": pp_text(parts["collection_effect"]),
             "sales_text": pp_text(parts["sales_effect"]),
@@ -483,67 +539,65 @@ def _blocked(query: Query, message: str) -> dict:
     }
 
 
-def build_main(store, query, compare, scope):
+def build_main(store, query, compare, scope, focus=None):
     ym = query.period
     region_rows = rate_slices(store, ym, compare, "region", scope)
     product_rows = rate_slices(store, ym, compare, "product_line", scope)
-    region_best = select_fastest(region_rows)
-    product_best = select_fastest(product_rows)
-    if region_best is None and product_best is None:
+    parent = resolve_chart_focus(region_rows, product_rows, focus)
+    if parent is None:
         return _blocked(query, "本数据无法支持：没有净销售占比达到 5% 且能计算环比的切片。")
-    if query.view == "product" and product_best is not None:
-        resolved = "product"
-    elif query.view == "region" and region_best is not None:
-        resolved = "region"
-    elif region_best is None:
-        resolved = "product"
-    elif product_best is None:
-        resolved = "region"
-    elif region_best["delta"] <= product_best["delta"]:
-        resolved = "region"
-    else:
-        resolved = "product"
-    primary = region_best if resolved == "region" else product_best
-    other = product_best if resolved == "region" else region_best
-    dimension = "region" if resolved == "region" else "product_line"
-    cross_dimension = "product_line" if resolved == "region" else "region"
-    focus = apply_member(scope, dimension, primary["key"])
-    title = slice_title(dimension, primary["name"])
-    other_text = ""
-    if other is not None:
-        other_dim = "product_line" if resolved == "region" else "region"
-        other_text = f"可切换{('产品' if resolved == 'region' else '大区')}视角（{slice_title(other_dim, other['name'])} {pp_text(other['delta'])}）。"
-    parts = decompose(primary["prev_collection"], primary["prev_net"], primary["collection"], primary["net"])
+    chosen = parent["row"]
+    default_row = parent["default_row"]
+    default_title = slice_title(parent["default_dimension"], default_row["name"])
+    chosen_title = slice_title(parent["dimension"], chosen["name"])
     text = (
-        f"{period_label(ym)}销售回款率下降最快：{title}（{pp_text(primary['delta'])}，净销售占比 {pct_text(primary['share'])}）。"
-        f"回款额变化贡献 {pp_text(parts['collection_effect'])}，净销售额变化贡献 {pp_text(parts['sales_effect'])}。"
-        f"{other_text}"
+        f"{period_label(ym)}销售回款率下降最快：{default_title}"
+        f"（{pp_text(default_row['delta'])}，净销售占比 {pct_text(default_row['share'])}）。"
+        f"{click_hint(parent['other_dimension'], parent['other'])}"
     )
-    conclusion = _say(text, _prov(F_RATE + F_DECOMP + F_GATE, _filters(store, ym, compare, Scope()), _rate_rows(region_rows) + _rate_rows(product_rows), [F_GATE]))
-    attribution = build_attribution(store, ym, compare, focus, cross_dimension, title)
+    provenance = _prov(
+        F_RATE + F_DECOMP + F_GATE,
+        _filters(store, ym, compare, Scope()),
+        _rate_rows(region_rows) + _rate_rows(product_rows),
+        [F_GATE],
+    )
+    sentences = [{"text": text, "provenance": provenance}]
+    if not parent["is_default"]:
+        viewing = f"当前查看：{chosen_title}。"
+        sentences.append({"text": viewing, "provenance": provenance})
+        text += viewing
+    conclusion = {"text": text, "sentences": sentences}
+    focus_scope = apply_member(scope, parent["dimension"], chosen["key"])
+    attribution = build_attribution(store, ym, compare, focus_scope, parent["cross_dimension"], chosen_title)
+    region_highlight = [chosen["name"]] if parent["dimension"] == "region" else []
+    line_highlight = [chosen["name"]] if parent["dimension"] == "product_line" else []
     charts = [
-        rate_chart(region_rows, "各大区销售回款率：本月 vs 上月", "region_rate", ym, compare, store, scope, "focus"),
-        rate_chart(product_rows, "各产品线销售回款率：本月 vs 上月", "line_rate", ym, compare, store, scope, "focus"),
+        rate_chart(
+            region_rows, "各大区销售回款率：本月 vs 上月", "region_rate", ym, compare, store, scope,
+            "attribution", highlight=region_highlight, drill_dimension="region",
+        ),
+        rate_chart(
+            product_rows, "各产品线销售回款率：本月 vs 上月", "line_rate", ym, compare, store, scope,
+            "attribution", highlight=line_highlight, drill_dimension="product_line",
+        ),
     ]
-    view_switch = {
-        "current": resolved,
-        "options": [
-            {
-                "id": "region",
-                "label": "大区视角",
-                "slice": "—" if region_best is None else f"{region_best['name']}大区",
-                "pp_text": "—" if region_best is None else pp_text(region_best["delta"]),
-            },
-            {
-                "id": "product",
-                "label": "产品视角",
-                "slice": "—" if product_best is None else product_best["name"],
-                "pp_text": "—" if product_best is None else pp_text(product_best["delta"]),
-            },
-        ],
+    reply = (
+        f"已生成{period_label(ym)}主问报告。下降最快的是{default_title}（{pp_text(default_row['delta'])}）。"
+        "左侧是结论、指标、对比图和归因。点柱可改归因父级。"
+    )
+    packed = _pack(
+        query, store, compare, scope, conclusion,
+        build_kpis(store, ym, compare, focus_scope),
+        charts, attribution, reply, None, parent["resolved"],
+    )
+    packed["attribution_target"] = {
+        "dimension": parent["dimension"],
+        "key": chosen["key"],
+        "name": chosen["name"],
+        "label": chosen_title,
+        "is_default": parent["is_default"],
     }
-    reply = f"已生成{period_label(ym)}主问报告。下降最快的是{title}（{pp_text(primary['delta'])}）。左侧是结论、指标、对比图和归因。"
-    return _pack(query, store, compare, scope, conclusion, build_kpis(store, ym, compare, scope), charts, attribution, reply, view_switch, resolved)
+    return packed
 
 
 def build_slice(store, query, compare, scope):
@@ -1333,7 +1387,7 @@ def comparable(store: Store, ym: str) -> tuple[str | None, str | None]:
     return compare, None
 
 
-def answer(store: Store, question: str, period: str, view: str = "auto") -> dict:
+def answer(store: Store, question: str, period: str, view: str = "auto", focus=None) -> dict:
     query = classify(question, period, view)
     if query.intent == "unsupported":
         return _blocked(query, query.message or "暂不支持。")
@@ -1341,4 +1395,6 @@ def answer(store: Store, question: str, period: str, view: str = "auto") -> dict
     if problem:
         return _blocked(query, problem)
     scope = Scope(region_id=query.region_id, product_line=query.product_line, tier=query.tier)
+    if query.intent == "main":
+        return build_main(store, query, compare, scope, focus)
     return BUILDERS[query.intent](store, query, compare, scope)

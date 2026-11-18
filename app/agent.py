@@ -1379,15 +1379,15 @@ def _route_contract(store: Store, text: str, period: str, view: str) -> dict | N
     return None
 
 
-def _without_model(store: Store, text: str, period: str, view: str) -> dict:
+def _without_model(store: Store, text: str, period: str, view: str, focus=None) -> dict:
     if text not in PRESET_TEXTS:
         routed = _route_contract(store, text, period, view)
         if routed is not None:
             return routed
-    return keyword_answer(store, text, period, view)
+    return keyword_answer(store, text, period, view, focus)
 
 
-def answer(store: Store, question: str, period: str, view: str = "auto", history: list[dict] | None = None) -> dict:
+def answer(store: Store, question: str, period: str, view: str = "auto", history: list[dict] | None = None, focus=None) -> dict:
     text = question.strip()
     drilled = try_customer_sku(store, text, period, view)
     if drilled is not None:
@@ -1405,7 +1405,7 @@ def answer(store: Store, question: str, period: str, view: str = "auto", history
     if counted is not None:
         return counted
     if text in PRESET_TEXTS or not os.environ.get("DEEPSEEK_API_KEY", "").strip():
-        return _without_model(store, text, period, view)
+        return _without_model(store, text, period, view, focus)
     chosen = resolve_period(text, period)
     blocked = hard_block_detail(text, chosen)
     if blocked:
@@ -1466,7 +1466,7 @@ def answer(store: Store, question: str, period: str, view: str = "auto", history
                     content = json.dumps({"error": f"未知工具：{name}"}, ensure_ascii=False)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": content})
     except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, TimeoutError, ValueError):
-        return _without_model(store, text, period, view)
+        return _without_model(store, text, period, view, focus)
     return _finish(store, text, chosen, view, "", queries)
 
 
