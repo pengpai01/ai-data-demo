@@ -592,6 +592,14 @@ def run_query(store: Store, args: dict, period: str) -> dict:
     }
 
 
+def _query_prov(query: dict) -> dict:
+    return _prov(
+        " ".join(dict.fromkeys(query.get("formulas") or [])),
+        query.get("filters") or [],
+        ((query.get("result") or {}).get("数据") or [])[:80],
+    )
+
+
 def _charts(query: dict) -> list[dict]:
     if query.get("roster"):
         return [{
@@ -604,10 +612,11 @@ def _charts(query: dict) -> list[dict]:
                 {"key": "等级", "label": "等级"},
             ],
             "rows": query["result"]["数据"],
+            "provenance": _query_prov(query),
         }]
     keys, months, groups, matrix = query["keys"], query["months"], query["groups"], query["matrix"]
     labels = [period_label(month) for month in months]
-    prov = _prov(" ".join(dict.fromkeys(query["formulas"])), query["filters"], query["result"]["数据"][:80])
+    prov = _query_prov(query)
     charts = []
     if query.get("table_only"):
         pass
@@ -750,7 +759,7 @@ def _free_report(store: Store, question: str, period: str, view: str, text: str,
         "view_switch": None,
         "page": "sheet",
         "page_title": last.get("page_title") or ("代理商名单" if roster else ("代理商数量" if count_only else question)),
-        "conclusion": {"sentences": [{"text": text}]} if text else None,
+        "conclusion": {"text": text, "sentences": [{"text": text, "provenance": _query_prov(last)}]} if text else None,
         "kpis": [],
         "charts": charts,
         "attribution": None,
@@ -811,7 +820,7 @@ def _roster_query(store: Store, period: str, region: str | None, tier: str | Non
     elif tier:
         title = f"{tier}级"
     else:
-        title = "各大大区"
+        title = "各大区"
     rows = _roster_rows(store, region_id, tier)
     return {
         "result": {
@@ -841,9 +850,9 @@ def _roster_reply(result: dict) -> str:
     counts: dict[str, int] = {}
     for row in rows:
         counts[row["大区"]] = counts.get(row["大区"], 0) + 1
-    if result["title"] == "各大大区":
+    if result["title"] == "各大区":
         parts = "、".join(f"{name}{count}家" for name, count in counts.items())
-        return f"各大大区代理商共{len(rows)}家。{parts}。"
+        return f"各大区代理商共{len(rows)}家。{parts}。"
     return f"{result['title']}代理商共{len(rows)}家。"
 
 
@@ -905,7 +914,7 @@ def try_region_agent_sales(store: Store, question: str, period: str, view: str) 
     parts = "、".join(f"{name}{count}家" for name, count in counts.items())
     scope_name = f"{regions[0]}大区" if regions else "五大区"
     reply = f"{period_label(chosen)}{scope_name}{len(rows)}家代理商都有销售。{parts}。下表按大区列出每一家的净销售额、出库额、回款额和销售回款率。"
-    title = f"{regions[0]}大区" if regions else "各大大区"
+    title = f"{regions[0]}大区" if regions else "各大区"
     result = {
         "result": {
             "范围": title,

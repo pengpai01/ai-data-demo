@@ -60,6 +60,10 @@ def test_page_shell_and_auto_question_wiring():
     assert "/api/meta" in script
     assert "/api/ask" in script
     assert "meta.main_question" in script
+    sheet = script[script.index("function renderSheet"):script.index("function renderAttribution")]
+    assert "sourceButton" in sheet
+    assert "sentence.provenance" in sheet
+    assert "chart.provenance" in sheet or "renderChart" in sheet
     static = script + (ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
     assert "DEEPSEEK" not in static
     assert re.search(r"sk-[A-Za-z0-9]{8,}", static) is None
@@ -72,12 +76,14 @@ def test_main_question_report_shape_and_view_switch():
     assert body["question_id"] == "p0_main"
     assert body["resolved_view"] == "region"
     assert "华东大区" in body["conclusion"]["text"]
-    assert "可切换大区视角" in body["conclusion"]["text"]
+    assert "可切换产品视角" in body["conclusion"]["text"]
     assert body["attribution"]["cross_title"] == "按产品线拆贡献"
     options = {item["label"]: item for item in body["view_switch"]["options"]}
-    assert options["产品视角"]["id"] == "region"
-    assert options["大区视角"]["id"] == "product"
+    assert options["大区视角"]["id"] == "region"
+    assert options["产品视角"]["id"] == "product"
     assert body["view_switch"]["current"] == "region"
+    selected = next(item for item in body["view_switch"]["options"] if item["id"] == body["view_switch"]["current"])
+    assert selected["label"] == "大区视角"
     assert "-24.14pp" in body["conclusion"]["text"]
     assert body["conclusion"]["sentences"][0]["provenance"]["formula"]
     assert body["conclusion"]["sentences"][0]["provenance"]["filters"]
@@ -100,7 +106,7 @@ def test_main_question_report_shape_and_view_switch():
     product = client.post("/api/ask", json={"question": MAIN_QUESTION, "period": "2026-10", "view": "product"}).json()
     assert product["resolved_view"] == "product"
     assert "试剂产品线" in product["conclusion"]["text"]
-    assert "可切换产品视角" in product["conclusion"]["text"]
+    assert "可切换大区视角" in product["conclusion"]["text"]
     assert product["attribution"]["cross_title"] == "按大区拆贡献"
     assert "区域性集中拖累" in product["attribution"]["signals"]
     region = client.post("/api/ask", json={"question": MAIN_QUESTION, "period": "2026-10", "view": "region"}).json()

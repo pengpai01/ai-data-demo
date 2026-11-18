@@ -190,11 +190,26 @@ def test_agents_per_region_is_a_count_table():
     assert "华东大区26家" in reply["chat_reply"]
     assert "共120家" in reply["chat_reply"]
     assert [chart["type"] for chart in reply["charts"]] == ["table"]
+    _assert_sheet_provenance(reply)
     assert reply["charts"][0]["rows"][-1] == {"范围": "合计", "月份": "2026年10月", "代理商数量": "120家"}
 
     by_line = agent.answer(STORE, "每个产品线有多少家代理商", "2026-10")
     assert [row["范围"] for row in by_line["charts"][0]["rows"]] == ["试剂产品线", "仪器产品线", "服务产品线"]
     assert "暂不支持" not in by_line["chat_reply"]
+
+
+
+def _assert_sheet_provenance(reply):
+    assert reply["page"] == "sheet"
+    sentence = reply["conclusion"]["sentences"][0]
+    assert sentence["provenance"]["formula"]
+    assert sentence["provenance"]["filters"]
+    assert sentence["provenance"]["rows"]
+    for chart in reply["charts"]:
+        assert chart["type"] == "table"
+        assert chart["provenance"]["formula"]
+        assert chart["provenance"]["filters"]
+        assert chart["provenance"]["rows"]
 
 
 def test_agent_roster_is_names_by_region_without_rank_or_chart():
@@ -204,6 +219,9 @@ def test_agent_roster_is_names_by_region_without_rank_or_chart():
     assert reply["compare_label"] == ""
     assert reply["page"] == "sheet"
     assert reply["page_title"] == "代理商名单"
+    _assert_sheet_provenance(reply)
+    assert "各大大区" not in reply["chat_reply"]
+    assert "各大区代理商共120家" in reply["chat_reply"]
     assert reply["period_label"] == "代理商名录"
     assert [chart["type"] for chart in reply["charts"]] == ["table"]
     table = reply["charts"][0]
@@ -226,6 +244,8 @@ def test_each_agent_sales_by_region_is_the_full_october_table():
     reply = agent.answer(STORE, "显示一下全国各大区下各代理商10月的销售情况", "2026-10")
     assert reply["page"] == "sheet"
     assert reply["page_title"] == "2026年10月各代理商销售"
+    _assert_sheet_provenance(reply)
+    assert "各大大区" not in reply["chat_reply"]
     assert "前20" not in reply["chat_reply"]
     assert "前 20" not in reply["chat_reply"]
     table = reply["charts"][0]
@@ -267,6 +287,7 @@ def test_reply_with_traceable_numbers_is_kept(monkeypatch):
     reply = agent.answer(STORE, "展示西北大区近半年的销售数据", "2026-10")
     assert reply["question_id"] == "free_query"
     assert reply["page"] == "sheet"
+    _assert_sheet_provenance(reply)
     assert reply["kpis"] == []
     assert reply["chat_reply"] == "西北大区区间合计净销售额 95,852,706.00元。"
     assert reply["conclusion"]["sentences"][0]["text"] == reply["chat_reply"]

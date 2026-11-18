@@ -530,15 +530,21 @@ function renderSheet(data) {
   back.addEventListener("click", () => ask(state.main, { view: "auto" }));
   head.append(title, back);
   root.appendChild(head);
-  const text = (data.conclusion?.sentences || []).map((sentence) => sentence.text).filter(Boolean).join("");
-  if (text) {
+  const sentences = data.conclusion?.sentences || [];
+  if (sentences.length) {
     const paragraph = document.createElement("p");
     paragraph.className = "sheet-text";
-    paragraph.textContent = text;
+    sentences.forEach((sentence) => {
+      if (!sentence.text) return;
+      const span = document.createElement("span");
+      span.textContent = sentence.text;
+      paragraph.appendChild(span);
+      if (sentence.provenance) paragraph.appendChild(sourceButton(sentence.provenance));
+    });
     root.appendChild(paragraph);
   }
   (data.charts || []).filter((chart) => chart.type === "table").forEach((chart) => {
-    root.appendChild(tableEl(chart.columns, chart.rows));
+    root.appendChild(renderChart(chart));
   });
 }
 
