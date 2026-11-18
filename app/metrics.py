@@ -30,6 +30,8 @@ class Scope:
     tier: str | None = None
     customer_id: str | None = None
     cohort: str | None = None
+    aging_bucket: str | None = None
+    unit: str | None = None
 
     def narrow(self, **kwargs: str | None) -> "Scope":
         data = {
@@ -39,6 +41,8 @@ class Scope:
             "tier": self.tier,
             "customer_id": self.customer_id,
             "cohort": self.cohort,
+            "aging_bucket": self.aging_bucket,
+            "unit": self.unit,
         }
         data.update(kwargs)
         return Scope(**data)
@@ -103,7 +107,7 @@ def match_row(store: Store, row: dict, scope: Scope, ym: str) -> bool:
         return False
     if scope.customer_id and row["customer_id"] != scope.customer_id:
         return False
-    if scope.product_line or scope.product_category:
+    if scope.product_line or scope.product_category or scope.unit:
         product_id = row.get("product_id") or ""
         product = store.products.get(product_id) if product_id else None
         if product is None:
@@ -112,6 +116,10 @@ def match_row(store: Store, row: dict, scope: Scope, ym: str) -> bool:
             return False
         if scope.product_category and product["product_category"] != scope.product_category:
             return False
+        if scope.unit and product["unit"] != scope.unit:
+            return False
+    if scope.aging_bucket and row.get("aging_bucket") != scope.aging_bucket:
+        return False
     customer = store.customers[row["customer_id"]]
     if scope.tier and customer["customer_tier"] != scope.tier:
         return False
@@ -145,6 +153,19 @@ def net_sales(store: Store, ym: str, scope: Scope = Scope()) -> Decimal:
 
 def list_amount(store: Store, ym: str, scope: Scope = Scope()) -> Decimal:
     return _sum(shipments(store, ym, scope), "list_amount")
+
+
+def shipment_qty(store: Store, ym: str, scope: Scope = Scope()) -> Decimal:
+    """Sum of qty. Caller must keep the slice to one product line and one unit."""
+    total = 0
+    for row in shipments(store, ym, scope):
+        total += row["qty"]
+    return Decimal(total)
+
+
+def new_ar(store: Store, ym: str, scope: Scope = Scope()) -> Decimal:
+    """本期新增应收. Each shipment is one invoice, so this equals net sales."""
+    return net_sales(store, ym, scope)
 
 
 def discount_amount(store: Store, ym: str, scope: Scope = Scope()) -> Decimal:
@@ -190,6 +211,33 @@ def overdue_rate(store: Store, ym: str, scope: Scope = Scope()) -> Decimal | Non
     if balance == 0:
         return None
     return overdue_balance(store, ym, scope) / balance
+
+
+def _without_bucket(scope: Scope) -> Scope:
+    if scope.aging_bucket is None:
+        return scope
+    return scope.narrow(aging_bucket=None)
+
+
+def aging_amount(store: Store, ym: str, scope: Scope = Scope()) -> Decimal:
+    """Outstanding in one aging bucket. Without a bucket, this is the whole balance."""
+    parent = _without_bucket(scope)
+    amounts = aging_amounts(store, ym, parent)
+    if scope.aging_bucket:
+        return amounts[scope.aging_bucket]
+    return sum(amounts.values(), ZERO)
+
+
+def aging_share(store: Store, ym: str, scope: Scope = Scope()) -> Decimal | None:
+    """Bucket amount / scope AR. The denominator ignores the bucket filter."""
+    if not scope.aging_bucket:
+        return None
+    parent = _without_bucket(scope)
+    amounts = aging_amounts(store, ym, parent)
+    total = sum(amounts.values(), ZERO)
+    if total == 0:
+        return None
+    return amounts[scope.aging_bucket] / total
 
 
 def due_amount(store: Store, ym: str, scope: Scope = Scope()) -> Decimal:
@@ -528,6 +576,56 @@ def large_due_invoices(store: Store, ym: str, scope: Scope, limit: int | None = 
     return found[:limit]
 
 
+def trailing_ready(ym: str, months: int) -> bool:
+    """True when the whole trailing window sits inside the operating months."""
+    start = shift_month(ym, 1 - months)
+    return start >= DATA_START and ym <= DATA_END
+
+
+def count_active_agents(store: Store, months: list[str], scope: Scope = Scope()) -> Decimal:
+    """Agents with a shipment in the window, or outstanding AR at the window end."""
+    end = months[-1]
+    total = 0
+    for customer in store.customers.values():
+        if scope.region_id and customer["region_id"] != scope.region_id:
+            continue
+        if scope.tier and customer["customer_tier"] != scope.tier:
+            continue
+        if scope.customer_id and customer["customer_id"] != scope.customer_id:
+            continue
+        child = scope.narrow(customer_id=customer["customer_id"])
+        shipped = any(shipments(store, month, child) for month in months)
+        if shipped or ar_balance(store, end, child) != 0:
+            total += 1
+    return Decimal(total)
+
+
+def count_collecting_agents(store: Store, months: list[str], scope: Scope = Scope()) -> Decimal:
+    """Agents with a collection in the window."""
+    total = 0
+    for customer in store.customers.values():
+        if scope.region_id and customer["region_id"] != scope.region_id:
+            continue
+        if scope.tier and customer["customer_tier"] != scope.tier:
+            continue
+        if scope.customer_id and customer["customer_id"] != scope.customer_id:
+            continue
+        child = scope.narrow(customer_id=customer["customer_id"])
+        if any(collection_rows(store, month, child) for month in months):
+            total += 1
+    return Decimal(total)
+
+
+def top5_ar_concentration(store: Store, ym: str, scope: Scope = Scope()) -> Decimal | None:
+    """Top 5 outstanding balances / AR balance. None when the balance is 0."""
+    balance = ar_balance(store, ym, scope)
+    if balance == 0:
+        return None
+    leaders = top_ar_customers(store, ym, scope, limit=5)
+    top = sum((row["outstanding"] for row in leaders), ZERO)
+    return top / balance
+
+
 def avg_collection_days(store: Store, ym: str, scope: Scope, months: int = 6) -> Decimal | None:
     """Amount-weighted days from invoice date to collection date, trailing window."""
     acc = ZERO
@@ -628,5 +726,9 @@ def filter_lines(store: Store, ym: str, compare: str | None, scope: Scope) -> li
         lines.append("代理商分组=老代理商")
     else:
         lines.append("代理商分组=全部")
+    if scope.aging_bucket:
+        lines.append(f"账龄={scope.aging_bucket}")
+    if scope.unit:
+        lines.append(f"单位={scope.unit}")
     lines.append("客户范围=全部为代理商")
     return lines

@@ -14,23 +14,35 @@ import urllib.error
 import urllib.request
 from decimal import Decimal
 
-from app.constants import DATA_END, DATA_START, LINE_ORDER, REGION_ORDER, TIER_ORDER
+from app.constants import BUCKETS, DATA_END, DATA_START, LINE_ORDER, REGION_ORDER, TIER_ORDER
+from app.contract_map import parse_question, primary_metric, should_direct
+from app.contract_map import UNMAPPED
 from app.metrics import (
     Scope,
+    aging_amount,
+    aging_share,
     ar_balance,
+    avg_collection_days,
     collection_amount,
     collection_rate,
+    count_active_agents,
+    count_collecting_agents,
     discount_amount,
     dso,
     due_amount,
     iter_months,
     list_amount,
     net_sales,
+    new_ar,
     overdue_balance,
     shift_month,
+    shipment_qty,
+    top5_ar_concentration,
+    trailing_ready,
     weighted_age_days,
 )
 from app.narrative import unknown_numbers
+from app.relations import OPERATIONS, RelationError, build_relation
 from app.reports import (
     BUILDERS,
     F_AGE_DAYS,
@@ -50,7 +62,7 @@ from app.reports import (
     build_kpis,
     comparable,
 )
-from app.router import INTENT_ID, QUESTIONS, REGION_NAMES, Query, hard_block, resolve_period
+from app.router import INTENT_ID, QUESTIONS, REGION_NAMES, Query, classify, hard_block_detail, resolve_period
 from app.store import Store
 from app.textfmt import days_num, days_signed, days_text, money_num, money_text, pct_num, pct_signed, pct_text, period_label, pp_text
 
@@ -64,22 +76,60 @@ REGION_ID = dict(REGION_NAMES)
 REGION_LABEL = {rid: name for name, rid in REGION_NAMES}
 
 # (label, kind, formula). Flow metrics sum over a window; balances do not.
+F_QTY = "出库量 = 统计期内出库行 qty 合计，按出库日。只在同一产品类，或同一产品线且单位一致时合计。财务结论以金额为准。"
+F_DUE_AMT = "本期到期应收 = 到期日落在统计月的发票原净额，含已回款。到期日 = 出库日 + 该代理商账期天数。"
+F_NEW_AR = "本期新增应收 = 本期净销售额。一笔出库对应一张发票。"
+F_AGING_AMT = "账龄金额 = 该账龄桶的月末未清金额。账龄只读月末快照，不用流水重算。"
+F_AGING_SHARE = "账龄占比 = 该桶金额 ÷ 应收余额。应收余额为 0 则本数据无法支持。"
+F_AVG_DAYS = "平均回款天数 = 近 6 个经营月已回款金额加权的（回款日 − 出库日）。未回款发票不进入。窗口不足则本数据无法支持。"
+F_ACTIVE = "活跃代理商数 = 期间有出库，或期末有应收的代理商家数。与有销售代理商家数不是同一个口径。"
+F_COLLECTING = "回款代理商数 = 期间有回款的代理商家数。"
+F_TOP5 = "前5家应收集中度 = 应收余额最高的 5 家未清金额 ÷ 应收余额。余额为 0 则本数据无法支持。"
+AGING_METRICS = {
+    "ar_balance",
+    "overdue_balance",
+    "overdue_rate",
+    "aging_amount",
+    "aging_share",
+    "weighted_age_days",
+    "top5_ar_concentration",
+}
+HEADCOUNT = {"customer_count", "active_agent_count", "collecting_agent_count"}
+COHORT_VALUES = {"new": "new", "old": "old", "新": "new", "老": "old", "新代理商": "new", "老代理商": "old"}
+
 METRICS = {
     "net_sales": ("净销售额", "money", F_NET),
     "list_amount": ("出库额", "money", F_SHIP),
+    "shipment_qty": ("出库量", "qty", F_QTY),
     "discount_amount": ("折扣额", "money", F_DISCOUNT),
     "discount_rate": ("折扣率", "pct", F_DISCOUNT),
     "collection_amount": ("回款额", "money", F_COL),
     "collection_rate": ("销售回款率", "pct", F_RATE),
+    "due_amount": ("本期到期应收", "money", F_DUE_AMT),
     "due_collection_rate": ("到期回款率（辅助）", "pct", F_DUE),
+    "new_ar": ("本期新增应收", "money", F_NEW_AR),
     "ar_balance": ("应收余额", "money", F_AR),
     "overdue_balance": ("逾期余额", "money", F_OVERDUE),
     "overdue_rate": ("逾期率", "pct", F_OVERDUE),
+    "aging_amount": ("账龄金额", "money", F_AGING_AMT),
+    "aging_share": ("账龄占比", "pct", F_AGING_SHARE),
     "dso": ("DSO", "days", F_DSO),
     "weighted_age_days": ("加权平均账龄", "days", F_AGE_DAYS),
+    "avg_collection_days": ("平均回款天数", "days", F_AVG_DAYS),
     "customer_count": ("代理商数量", "count", "有销售数据的代理商：该范围内净销售额不为 0 的家数"),
+    "active_agent_count": ("活跃代理商数", "count", F_ACTIVE),
+    "collecting_agent_count": ("回款代理商数", "count", F_COLLECTING),
+    "top5_ar_concentration": ("前5家应收集中度", "pct", F_TOP5),
 }
-FLOW = {"net_sales": net_sales, "list_amount": list_amount, "discount_amount": discount_amount, "collection_amount": collection_amount}
+FLOW = {
+    "net_sales": net_sales,
+    "list_amount": list_amount,
+    "shipment_qty": shipment_qty,
+    "discount_amount": discount_amount,
+    "collection_amount": collection_amount,
+    "due_amount": due_amount,
+    "new_ar": new_ar,
+}
 
 INTENT_GUIDE = {
     "main": "上个月哪个大区/哪类产品的销售回款率下降最快，原因是什么（主问）",
@@ -114,7 +164,10 @@ SYSTEM = """你是星澜诊断的经营分析助手，回答代理商销售与�
    - 问代理商名单、列表、有哪些代理商时，调用 list_customers。客户维度只有大区、名称、等级。不要查销售额或回款，不要排名，不要图表，也不要补账期、产品线等没问到的字段。
    - 问各大区下每一家代理商的销售、不是问谁最高或前几名时，不要用 top_n 截成前 20，也不要按回款率再排一次名。按大区列出全部代理商的净销售额、出库额、回款额、销售回款率。
    - 没说明排序依据的「排序」，按销售回款率、order=value 排。
-3. 需要本数据没有的信息（承诺回款、直营、医院或体检中心作为客户、退货、坏账、代理商库存、预测、目标或预算等），或与经营分析无关时，调用 reject 说明原因。
+3. 地图里还有这些取数，用 query_metrics：出库量（不能跨产品线或跨单位合计）、本期到期应收、本期新增应收、账龄金额、账龄占比、平均回款天数、活跃代理商数、回款代理商数、前5家应收集中度。过滤和分组可以用 cohort（新代理商/老代理商）和 aging_bucket（未到期、1–30、31–60、61–90、90+，账龄桶只用于应收/账龄指标）。
+4. 率变分解、交叉贡献、代理商贡献、账龄迁移、应收月环比拆解、月初月末出货对照、下降最快，对用户给出的合法父切片调用 query_relation，不要只绑在主报告上。下降最快的 5% 门槛只用于这一次评选。
+5. 省区不能下钻。承诺回款、退货、坏账、库存、汇率、毛利、利润、费用、现金流、直营、经销商、医院或体检中心作为销售客户、按医院或按承诺拆回款，调用 reject，并说明缺的是指标、维度、时间窗、关联、非法组合，还是无法映射。
+6. 需要本数据没有的信息，或与经营分析无关时，调用 reject 说明原因。「冲量出货抬高分母」「大代理商延期」只能写成与实算相容的一种解释，不能写成已经证实的原因。
 
 回答规则：
 - 只能引用工具返回的数字，按原样抄写（含千分位、小数、单位、正负号）。不得自己加减乘除、估算或换算单位（不要把元换成万元）。工具没给的合计、占比、差值，写「本数据无法支持」。
@@ -172,7 +225,10 @@ TOOLS = [
                     "product": {"type": "string", "description": "具体产品名称，例如肝功试剂、全自动生化分析仪、年度维保"},
                     "tier": {"type": "string", "enum": list(TIER_ORDER)},
                     "customer": {"type": "string", "description": "代理商名称"},
-                    "group_by": {"type": "string", "enum": ["none", "region", "product_line", "product", "tier", "customer"]},
+                    "cohort": {"type": "string", "enum": ["新代理商", "老代理商"]},
+                    "aging_bucket": {"type": "string", "enum": list(BUCKETS), "description": "只用于应收或账龄指标"},
+                    "unit": {"type": "string", "description": "出库量声明的同一单位，例如盒、人份、台、次"},
+                    "group_by": {"type": "string", "enum": ["none", "region", "product_line", "product", "tier", "customer", "cohort", "aging_bucket"]},
                     "order": {
                         "type": "string",
                         "enum": ["value", "low", "drop", "rise"],
@@ -181,6 +237,39 @@ TOOLS = [
                     "top_n": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
                 "required": ["metrics"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_relation",
+            "description": (
+                "对一个合法父切片计算地图内的关系并出表。"
+                "rate_decompose 率变分解；cross_contribute 交叉贡献（dimension 是父切片还没固定的维）；"
+                "agent_contribute 代理商贡献（rank=drag 为拖累，rank=top 为贡献最大）；"
+                "aging_migration 账龄迁移；ar_bridge 应收月环比拆解；month_timing 月初/月末 7 日出货；"
+                "fastest_decline 下降最快，5% 门槛只在这一次评选里使用。"
+                "上期不在经营月内或分母为 0 时，表内写本数据无法支持，不要编数。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {"type": "string", "enum": list(OPERATIONS)},
+                    "dimension": {"type": "string", "enum": ["region", "product_line", "product", "tier", "cohort", "customer"]},
+                    "rank": {"type": "string", "enum": ["drag", "top"]},
+                    "start_month": {"type": "string"},
+                    "end_month": {"type": "string"},
+                    "region": {"type": "string", "enum": [name for name, _ in REGION_NAMES]},
+                    "product_line": {"type": "string", "enum": list(LINE_ORDER)},
+                    "product": {"type": "string"},
+                    "tier": {"type": "string", "enum": list(TIER_ORDER)},
+                    "customer": {"type": "string"},
+                    "cohort": {"type": "string", "enum": ["新代理商", "老代理商"]},
+                    "aging_bucket": {"type": "string", "enum": list(BUCKETS)},
+                    "top_n": {"type": "integer", "minimum": 1, "maximum": 20},
+                },
+                "required": ["operation"],
             },
         },
     },
@@ -259,6 +348,10 @@ def _metric_value(store: Store, key: str, months: list[str], scope: Scope) -> De
     """One month, or a window total when len(months) > 1 (flow metrics only)."""
     if key == "customer_count":
         return _agents_with_sales(store, months, scope)
+    if key == "active_agent_count":
+        return count_active_agents(store, months, scope)
+    if key == "collecting_agent_count":
+        return count_collecting_agents(store, months, scope)
     if len(months) > 1:
         if key in FLOW:
             return sum((FLOW[key](store, m, scope) for m in months), Decimal("0"))
@@ -295,11 +388,23 @@ def _metric_value(store: Store, key: str, months: list[str], scope: Scope) -> De
         return dso(store, month, scope)
     if key == "weighted_age_days":
         return weighted_age_days(store, month, scope)
+    if key == "aging_amount":
+        return aging_amount(store, month, scope)
+    if key == "aging_share":
+        return aging_share(store, month, scope)
+    if key == "avg_collection_days":
+        if not trailing_ready(month, 6):
+            return None
+        return avg_collection_days(store, month, scope, 6)
+    if key == "top5_ar_concentration":
+        return top5_ar_concentration(store, month, scope)
     raise ToolError(f"未知指标：{key}")
 
 
-def _text(kind: str, value: Decimal | None) -> str:
+def _text(kind: str, value: Decimal | None, unit: str | None = None) -> str:
     if value is None:
+        if kind in {"pct", "days"}:
+            return "本数据无法支持"
         return "—"
     if kind == "money":
         return money_text(value)
@@ -307,6 +412,9 @@ def _text(kind: str, value: Decimal | None) -> str:
         return pct_text(value)
     if kind == "count":
         return f"{int(value)}家"
+    if kind == "qty":
+        number = f"{int(value):,}"
+        return f"{number}{unit}" if unit else number
     return days_text(value)
 
 
@@ -318,6 +426,10 @@ def _delta_text(kind: str, prev: Decimal | None, cur: Decimal | None) -> str:
     if kind == "count":
         homes = int(delta)
         return f"+{homes}家" if homes > 0 else f"{homes}家"
+    if kind == "qty":
+        number = int(delta)
+        text = f"{abs(number):,}"
+        return f"+{text}" if number > 0 else f"-{text}" if number < 0 else "0"
     if kind == "money":
         text = money_text(delta)
         return f"+{text}" if delta > 0 else text
@@ -333,6 +445,8 @@ def _change(kind: str, prev: Decimal | None, cur: Decimal | None) -> str:
     if kind == "count":
         homes = int(cur - prev)
         return f"+{homes}家" if homes > 0 else f"{homes}家"
+    if kind == "qty":
+        return "—" if prev == 0 else pct_signed((cur - prev) / prev)
     if kind == "days" and abs(cur - prev) < Decimal("0.05"):
         return "0.0天"
     if kind == "pct" and abs(cur - prev) < Decimal("0.00005"):
@@ -352,6 +466,8 @@ def _num(kind: str, value: Decimal | None):
     if kind == "pct":
         return pct_num(value)
     if kind == "count":
+        return int(value)
+    if kind == "qty":
         return int(value)
     return days_num(value)
 
@@ -382,7 +498,63 @@ def _scope_label(store: Store, scope: Scope, customer: dict | None) -> str:
         parts.append(f"{scope.product_line}产品线")
     if scope.tier:
         parts.append(f"{scope.tier}级代理商")
+    if scope.cohort == "new":
+        parts.append("新代理商")
+    elif scope.cohort == "old":
+        parts.append("老代理商")
+    if scope.aging_bucket:
+        parts.append(f"账龄{scope.aging_bucket}")
+    if scope.unit:
+        parts.append(scope.unit)
     return " · ".join(parts) or "公司合计"
+
+
+def _bucket_arg(value) -> str | None:
+    if not value:
+        return None
+    text = str(value).strip().replace("－", "–")
+    aliases = {"1-30": "1–30", "31-60": "31–60", "61-90": "61–90", "90天以上": "90+", "90＋": "90+"}
+    text = aliases.get(text, text)
+    if text not in BUCKETS:
+        raise ToolError("未知账龄桶：" + text + "。可选 " + "、".join(BUCKETS))
+    return text
+
+
+def _products_in(store: Store, scope: Scope) -> list[dict]:
+    picked = []
+    for product in store.products.values():
+        if scope.product_line and product["product_line"] != scope.product_line:
+            continue
+        if scope.product_category and product["product_category"] != scope.product_category:
+            continue
+        if scope.unit and product["unit"] != scope.unit:
+            continue
+        picked.append(product)
+    return picked
+
+
+def _single_unit(store: Store, scope: Scope) -> str | None:
+    units = {product["unit"] for product in _products_in(store, scope)}
+    if len(units) == 1:
+        return next(iter(units))
+    return None
+
+
+def _assert_qty(store: Store, scopes: list[Scope]) -> None:
+    for scope in scopes:
+        products = _products_in(store, scope)
+        if not products:
+            raise ToolError("这个切片没有对应的产品，不能合计出库量。")
+        lines = {product["product_line"] for product in products}
+        units = {product["unit"] for product in products}
+        if len(lines) != 1 or len(units) != 1:
+            raise ToolError("出库量不能跨产品线合计，也不能把不同单位（盒、人份、瓶、台、次）加在一起。请按产品类、按单位一致的产品线，或声明同一单位。")
+
+
+def _show(store: Store, key: str, value: Decimal | None, scope: Scope) -> str:
+    kind = METRICS[key][1]
+    unit = _single_unit(store, scope) if kind == "qty" else None
+    return _text(kind, value, unit)
 
 
 def run_query(store: Store, args: dict, period: str) -> dict:
@@ -397,31 +569,16 @@ def run_query(store: Store, args: dict, period: str) -> dict:
     if len(months) > MAX_MONTHS:
         raise ToolError(f"一次最多查 {MAX_MONTHS} 个月")
 
-    region = args.get("region")
-    if region and region not in REGION_ID:
-        raise ToolError(f"未知大区：{region}")
-    line = args.get("product_line")
-    if line and line not in LINE_ORDER:
-        raise ToolError(f"未知产品线：{line}")
-    tier = args.get("tier")
-    if tier and tier not in TIER_ORDER:
-        raise ToolError(f"未知等级：{tier}")
-    customer = _find_customer(store, args["customer"]) if args.get("customer") else None
-    product = _find_product(store, args["product"]) if args.get("product") else None
-    if product and line and product["product_line"] != line:
-        raise ToolError(f"{product['product_category']}属于{product['product_line']}产品线，不属于{line}")
-    base = Scope(
-        region_id=REGION_ID.get(region) if region else None,
-        product_line=(product["product_line"] if product else line) or None,
-        product_category=product["product_category"] if product else None,
-        tier=tier or None,
-        customer_id=customer["customer_id"] if customer else None,
-    )
-    title = _scope_label(store, base, customer)
+    base, title, customer = _scope_parts(store, args)
 
     group_by = args.get("group_by") or "none"
     if customer and group_by == "customer":
         group_by = "none"
+    if group_by in {"none", ""} and not base.aging_bucket and any(key in {"aging_amount", "aging_share"} for key in keys):
+        if all(key in AGING_METRICS for key in keys):
+            group_by = "aging_bucket"
+    if (base.aging_bucket or group_by == "aging_bucket") and any(key not in AGING_METRICS for key in keys):
+        raise ToolError("账龄桶只能用于应收或账龄指标，不能用来分组净销售、回款额或出库量。")
     order = args.get("order") or "value"
     if order not in {"value", "low", "drop", "rise"}:
         raise ToolError("order 只能是 value、low、drop 或 rise")
@@ -442,8 +599,13 @@ def run_query(store: Store, args: dict, period: str) -> dict:
         groups.sort(key=lambda item: item[0])
     elif group_by == "tier":
         groups = [(f"{name}级代理商", base.narrow(tier=name)) for name in TIER_ORDER if not base.tier or base.tier == name]
+    elif group_by == "cohort":
+        members = [("new", "新代理商"), ("old", "老代理商")]
+        groups = [(label, base.narrow(cohort=key)) for key, label in members if not base.cohort or base.cohort == key]
+    elif group_by == "aging_bucket":
+        groups = [(bucket, base.narrow(aging_bucket=bucket)) for bucket in BUCKETS if not base.aging_bucket or base.aging_bucket == bucket]
     elif group_by == "customer":
-        if "customer_count" in keys:
+        if HEADCOUNT & set(keys):
             raise ToolError("统计代理商家数时不要按代理商分组，请用 group_by=none、region、product_line 或 tier")
         top_n = max(1, min(int(args.get("top_n") or 10), 20))
         if order in {"value", "low"}:
@@ -512,6 +674,12 @@ def run_query(store: Store, args: dict, period: str) -> dict:
         groups = [(title, base)]
     if "customer_names" not in locals():
         customer_names = {}
+    if "shipment_qty" in keys:
+        _assert_qty(store, [scope for _label, scope in groups])
+        if groups:
+            units = {_single_unit(store, scope) for _label, scope in groups}
+            if len(units) == 1 and None not in units:
+                notes.append(f"出库量单位为{next(iter(units))}，没有跨产品线、也没有跨单位合计。")
     if len(groups) * len(months) * len(keys) > MAX_CELLS:
         raise ToolError("结果太大，请缩小月份或分组")
 
@@ -537,7 +705,7 @@ def run_query(store: Store, args: dict, period: str) -> dict:
         notes.append(f"已按{span}的{METRICS[keys[0]][0]}从高到低排序。点击表头可改按其他列排序。")
     rows = []
     if group_by == "customer" and order in {"drop", "rise"}:
-        for rank, (label, _scope) in enumerate(groups, start=1):
+        for rank, (label, scope) in enumerate(groups, start=1):
             row = {"排名": str(rank), "范围": label, "期初": period_label(months[0]), "期末": period_label(months[-1])}
             if label in customer_names:
                 row["_客户"] = customer_names[label]
@@ -545,8 +713,8 @@ def run_query(store: Store, args: dict, period: str) -> dict:
                 kind = METRICS[key][1]
                 name = METRICS[key][0]
                 opened, closed = matrix[label][key]
-                row[f"期初{name}"] = _text(kind, opened)
-                row[f"期末{name}"] = _text(kind, closed)
+                row[f"期初{name}"] = _show(store, key, opened, scope)
+                row[f"期末{name}"] = _show(store, key, closed, scope)
                 row[f"{name}变动"] = _delta_text(kind, opened, closed)
                 if kind == "money":
                     row[f"{name}环比"] = _change(kind, opened, closed)
@@ -558,7 +726,7 @@ def run_query(store: Store, args: dict, period: str) -> dict:
                 row["_客户"] = customer_names[label]
             for key in keys:
                 kind = METRICS[key][1]
-                row[f"{METRICS[key][0]}区间合计"] = _text(kind, _metric_value(store, key, months, scope))
+                row[f"{METRICS[key][0]}区间合计"] = _show(store, key, _metric_value(store, key, months, scope), scope)
             rows.append(row)
     else:
         for rank, (label, scope) in enumerate(groups, start=1):
@@ -571,14 +739,14 @@ def run_query(store: Store, args: dict, period: str) -> dict:
                 for key in keys:
                     kind = METRICS[key][1]
                     series = matrix[label][key]
-                    row[METRICS[key][0]] = _text(kind, series[index])
+                    row[METRICS[key][0]] = _show(store, key, series[index], scope)
                     if len(months) > 1:
                         row[f"{METRICS[key][0]}环比"] = "—" if index == 0 else _change(kind, series[index - 1], series[index])
                 rows.append(row)
             if len(months) > 1:
                 row = {"范围": label, "月份": "区间合计"}
                 for key in keys:
-                    row[METRICS[key][0]] = _text(METRICS[key][1], _metric_value(store, key, months, scope))
+                    row[METRICS[key][0]] = _show(store, key, _metric_value(store, key, months, scope), scope)
                     row[f"{METRICS[key][0]}环比"] = "—"
                 rows.append(row)
 
@@ -700,7 +868,112 @@ def _charts(query: dict) -> list[dict]:
 
 
 def _group_name(group_by: str) -> str:
-    return {"region": "大区", "product_line": "产品线", "product": "产品", "tier": "等级", "customer": "代理商"}.get(group_by, "范围")
+    return {
+        "region": "大区",
+        "product_line": "产品线",
+        "product": "产品",
+        "tier": "等级",
+        "customer": "代理商",
+        "cohort": "新老代理商",
+        "aging_bucket": "账龄",
+    }.get(group_by, "范围")
+
+
+def _refuse(question: str, period: str, view: str, kind: str, message: str) -> dict:
+    if not message.startswith("暂不支持"):
+        message = f"暂不支持。{kind}：{message}"
+    elif kind not in message:
+        message = f"暂不支持。{kind}：{message.removeprefix('暂不支持').lstrip('。')}"
+    body = _blocked(Query("unsupported", "unsupported", question, period, view), message)
+    body["refusal_type"] = kind
+    return body
+
+
+def _refuse_tool(question: str, period: str, view: str, error: Exception) -> dict:
+    message = str(error)
+    if "超出数据范围" in message or "YYYY-MM" in message:
+        kind = "缺时间窗"
+    elif message.startswith("未知") or "没有找到" in message or "不唯一" in message:
+        kind = "缺维度"
+    elif "未知指标" in message or "至少给一个有效指标" in message:
+        kind = "缺指标"
+    else:
+        kind = "非法组合"
+    return _refuse(question, period, view, kind, message)
+
+
+def run_relation(store: Store, args: dict, period: str) -> dict:
+    operation = str(args.get("operation") or "")
+    if operation not in OPERATIONS:
+        raise ToolError(f"未知运算：{operation}")
+    scope, title, _customer = _scope_parts(store, args)
+    end = _month_arg(args.get("end_month"), period)
+    try:
+        built = build_relation(store, operation, scope, end, args)
+    except RelationError as error:
+        raise ToolError(str(error)) from error
+    return {
+        "result": {
+            "范围": title,
+            "窗口": period_label(end),
+            "分组": operation,
+            "说明": built["notes"],
+            "数据": built["rows"],
+        },
+        "keys": [operation],
+        "months": [end],
+        "groups": [title],
+        "matrix": {},
+        "scope": scope,
+        "title": title,
+        "group_by": "none",
+        "order": args.get("rank") or "value",
+        "table_only": True,
+        "plain_sheet": True,
+        "op_name": built["op_name"],
+        "filters": [f"范围={title}", f"月份={period_label(end)}", f"运算={built['op_name']}"],
+        "formulas": [built["formula"]],
+        "page_title": f"{title}{built['op_name']}",
+    }
+
+
+def _scope_parts(store: Store, args: dict) -> tuple[Scope, str, dict | None]:
+    """Shared filter parsing for query_metrics and query_relation."""
+    region = args.get("region")
+    if region and region not in REGION_ID:
+        raise ToolError(f"未知大区：{region}")
+    line = args.get("product_line")
+    if line and line not in LINE_ORDER:
+        raise ToolError(f"未知产品线：{line}")
+    tier = args.get("tier")
+    if tier and tier not in TIER_ORDER:
+        raise ToolError(f"未知等级：{tier}")
+    customer = _find_customer(store, args["customer"]) if args.get("customer") else None
+    product = _find_product(store, args["product"]) if args.get("product") else None
+    if product and line and product["product_line"] != line:
+        raise ToolError(f"{product['product_category']}属于{product['product_line']}产品线，不属于{line}")
+    cohort_raw = args.get("cohort")
+    cohort = None
+    if cohort_raw:
+        if cohort_raw not in COHORT_VALUES:
+            raise ToolError("未知新老口径。可选：新代理商、老代理商。")
+        cohort = COHORT_VALUES[cohort_raw]
+    unit = str(args.get("unit") or "").strip() or None
+    if unit:
+        known_units = sorted({row["unit"] for row in store.products.values()})
+        if unit not in known_units:
+            raise ToolError(f"未知单位：{unit}。可选 {'、'.join(known_units)}。")
+    scope = Scope(
+        region_id=REGION_ID.get(region) if region else None,
+        product_line=(product["product_line"] if product else line) or None,
+        product_category=product["product_category"] if product else None,
+        tier=tier or None,
+        customer_id=customer["customer_id"] if customer else None,
+        cohort=cohort,
+        aging_bucket=_bucket_arg(args.get("aging_bucket")),
+        unit=unit,
+    )
+    return scope, _scope_label(store, scope, customer), customer
 
 
 def _call_model(messages: list[dict]) -> dict:
@@ -754,7 +1027,7 @@ def _free_report(store: Store, question: str, period: str, view: str, text: str,
     single = len(months) == 1
     count_only = last["keys"] == ["customer_count"]
     roster = bool(last.get("roster"))
-    plain = count_only or roster
+    plain = count_only or roster or bool(last.get("plain_sheet"))
     query = Query("free", "free_query", question, end, view)
     return {
         "ok": True,
@@ -1009,16 +1282,15 @@ def try_agent_extreme(store: Store, question: str, period: str, view: str) -> di
     if window is None:
         return None
     start, end = window
-    metric = "net_sales"
-    if "回款率" in raw:
-        metric = "collection_rate"
-    elif "回款" in raw and "销售" not in raw:
-        metric = "collection_amount"
-    result = run_query(
-        store,
-        {"metrics": [metric], "group_by": "customer", "order": "low" if low else "value", "top_n": number, "start_month": start, "end_month": end},
-        end,
-    )
+    metric = primary_metric(raw) or "net_sales"
+    try:
+        result = run_query(
+            store,
+            {"metrics": [metric], "group_by": "customer", "order": "low" if low else "value", "top_n": number, "start_month": start, "end_month": end},
+            end,
+        )
+    except ToolError as error:
+        return _refuse_tool(raw, end, view, error)
     rows = result["result"]["数据"]
     label = METRICS[metric][0]
     direction = "最低" if low else "最高"
@@ -1033,7 +1305,7 @@ def try_agent_count(store: Store, question: str, period: str, view: str) -> dict
     raw = question.strip()
     if not re.search(r"多少家|有几家|几家代理|多少个代理|代理商数量|有多少代理|多少代理商", raw):
         return None
-    if re.search(r"销售|回款|出库|折扣|下滑|下降|增长|上升|最高|最低|最好|最差|排名|排行|拖累|欠款|逾期|账龄|DSO|dso|对比|环比", raw, re.I):
+    if re.search(r"销售|回款|出库|折扣|下滑|下降|增长|上升|最高|最低|最好|最差|排名|排行|拖累|欠款|逾期|账龄|DSO|dso|对比|环比|活跃|集中度", raw, re.I):
         return None
     chosen = resolve_period(raw, period)
     regions = [name for name, _rid in REGION_NAMES if name in raw]
@@ -1059,6 +1331,62 @@ def try_agent_count(store: Store, question: str, period: str, view: str) -> dict
     return _free_report(store, raw, chosen, view, _count_reply(result), [result])
 
 
+def _query_reply(result: dict) -> str:
+    rows = [row for row in result["result"]["数据"] if row.get("月份") != "区间合计" and row.get("范围") != "合计"]
+    labels = [METRICS[key][0] for key in result["keys"] if key in METRICS]
+    window = result["result"]["窗口"]
+    title = result["title"]
+    if len(rows) == 1:
+        bits = [f"{label}{rows[0][label]}" for label in labels if label in rows[0]]
+        reply = f"{window}{title}{'，'.join(bits)}。"
+    else:
+        reply = f"已列出{window}{title}的{'、'.join(labels)}。"
+    if "本数据无法支持" in json.dumps(result["result"]["数据"], ensure_ascii=False) and "本数据无法支持" not in reply:
+        reply += "本数据无法支持的项目已在表中标明。"
+    return reply
+
+
+def _relation_reply(result: dict) -> str:
+    reply = f"已列出{result['result']['窗口']}{result['title']}的{result['op_name']}。"
+    if "本数据无法支持" in json.dumps(result["result"]["数据"], ensure_ascii=False):
+        reply += "算不出的项目为本数据无法支持。"
+    return reply
+
+
+def _execute_plan(store: Store, text: str, period: str, view: str, plan: dict) -> dict:
+    try:
+        if plan["action"] == "relation":
+            result = run_relation(store, plan["args"], period)
+            reply = _relation_reply(result)
+        else:
+            result = run_query(store, plan["args"], period)
+            reply = _query_reply(result)
+    except ToolError as error:
+        return _refuse_tool(text, resolve_period(text, period), view, error)
+    return _free_report(store, text, period, view, reply, [result])
+
+
+def _route_contract(store: Store, text: str, period: str, view: str) -> dict | None:
+    """Map to the contract enums. None lets a preset report answer."""
+    plan = parse_question(store, text, period)
+    classified = classify(text, period, view)
+    if plan and plan["action"] == "refuse":
+        return _refuse(text, classified.period, view, plan["refusal_type"], plan["message"])
+    if plan and plan["action"] in {"query", "relation"} and should_direct(classified.intent, plan):
+        return _execute_plan(store, text, period, view, plan)
+    if classified.intent == "unsupported":
+        return _refuse(text, classified.period, view, UNMAPPED["refusal_type"], UNMAPPED["message"])
+    return None
+
+
+def _without_model(store: Store, text: str, period: str, view: str) -> dict:
+    if text not in PRESET_TEXTS:
+        routed = _route_contract(store, text, period, view)
+        if routed is not None:
+            return routed
+    return keyword_answer(store, text, period, view)
+
+
 def answer(store: Store, question: str, period: str, view: str = "auto", history: list[dict] | None = None) -> dict:
     text = question.strip()
     drilled = try_customer_sku(store, text, period, view)
@@ -1077,11 +1405,11 @@ def answer(store: Store, question: str, period: str, view: str = "auto", history
     if counted is not None:
         return counted
     if text in PRESET_TEXTS or not os.environ.get("DEEPSEEK_API_KEY", "").strip():
-        return keyword_answer(store, text, period, view)
+        return _without_model(store, text, period, view)
     chosen = resolve_period(text, period)
-    blocked = hard_block(text, chosen)
+    blocked = hard_block_detail(text, chosen)
     if blocked:
-        return _blocked(Query("unsupported", "unsupported", text, chosen, view), blocked)
+        return _refuse(text, chosen, view, blocked[0], blocked[1])
 
     system = SYSTEM.format(
         label=period_label(chosen),
@@ -1127,11 +1455,18 @@ def answer(store: Store, question: str, period: str, view: str = "auto", history
                         content = json.dumps(result["result"], ensure_ascii=False)
                     except ToolError as error:
                         content = json.dumps({"error": str(error)}, ensure_ascii=False)
+                elif name == "query_relation":
+                    try:
+                        result = run_relation(store, args, chosen)
+                        queries.append(result)
+                        content = json.dumps(result["result"], ensure_ascii=False)
+                    except ToolError as error:
+                        content = json.dumps({"error": str(error)}, ensure_ascii=False)
                 else:
                     content = json.dumps({"error": f"未知工具：{name}"}, ensure_ascii=False)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": content})
     except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, TimeoutError, ValueError):
-        return keyword_answer(store, text, period, view)
+        return _without_model(store, text, period, view)
     return _finish(store, text, chosen, view, "", queries)
 
 
@@ -1139,8 +1474,7 @@ def _finish(store: Store, question: str, period: str, view: str, text: str, quer
     if not queries:
         if text and not re.search(r"\d", text):
             return {**_blocked(Query("free", "free_chat", question, period, view), text), "supported": True}
-        return _blocked(Query("unsupported", "unsupported", question, period, view),
-                        "暂不支持。这个问题超出当前业务地图（销售回款率、大区、产品线、代理商等级、账龄）。")
+        return _refuse(question, period, view, UNMAPPED["refusal_type"], UNMAPPED["message"])
     sheet = json.dumps([item["result"] for item in queries], ensure_ascii=False)
     if not text or unknown_numbers(text, sheet):
         text = f"已在左侧列出计算结果（{queries[-1]['title']} · {queries[-1]['result']['窗口']}）。模型的文字说明引用了计算结果里没有的数字，已不展示。" if text else \
